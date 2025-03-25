@@ -1,4 +1,3 @@
-
 from PyQt5 import QtWidgets
 from GUI.editor import SplineEditor
 import sys

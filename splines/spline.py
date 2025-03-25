@@ -21,6 +21,7 @@ class Spline:
         self.control_points = control_points
         self.joint_points = joint_points
         self.curve = curve
+        self.__ctrl_pts_per_section = self.curve.degree - 1
 
     
     def evaluate(self, t):
@@ -41,14 +42,27 @@ class Spline:
 
         u = (len(self.joint_points) - 1) * t
 
-        num_control_points = self.curve.degree - 1
 
         point_index, polynomial_t = divmod(u, 1)
         point_index = int(point_index)
 
-        current_control = self.control_points[point_index * num_control_points : (point_index + 1) * num_control_points]
+        current_control = self.control_points[point_index * self.__ctrl_pts_per_section : (point_index + 1) * self.__ctrl_pts_per_section]
 
         return self.curve.evaluate(polynomial_t, np.array([self.joint_points[point_index]] + current_control + [self.joint_points[point_index + 1]]))
+    
+    def get_lines(self):
+        lines = []
+
+        for i in range(len(self.joint_points)):
+            if i > 0:
+                lines.append(np.array([self.joint_points[i], self.control_points[self.__ctrl_pts_per_section * i - 1]]))
+            
+            if i < len(self.joint_points) - 1:
+                lines.append(np.array([self.joint_points[i], self.control_points[self.__ctrl_pts_per_section * i]]))
+        
+        return lines
+
+
     
 
         
