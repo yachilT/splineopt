@@ -1,54 +1,48 @@
-from typing import List, Tuple
 import numpy as np
+import torch
 from .curve import Curve
 
 class Spline:
-    def __init__(self, control_points: List[Tuple[float, float]], joint_points: List[Tuple[float, float]], curve: Curve):
+    def __init__(self, control_points: torch.Tensor, joint_points: torch.Tensor, curve: Curve):
         """
-        Initialize the spline object with control points, joint points, and degree of the spline.
+        Initialize the spline object with control points, joint points, and curve object.
         
         Parameters:
-            control_points (np.ndarray): Array of control points, shape (n, 2).
-            joint_points (np.ndarray): Array of joint points (sample points), shape (m, 2).
-            degree (int): Degree of the spline, default is cubic B-splines (degree=3).
+            control_points (torch.Tensor): Tensor of control points, shape (n, 2).
+            joint_points (torch.Tensor): Tensor of joint points, shape (m, 2).
+            curve (Curve): Curve object for evaluating the spline.
         """
-
         if (len(joint_points) - 1) * (curve.degree - 1) != len(control_points):
-            raise ValueError("number of control points doesn't fit the bezier degree")
-        
-        
+            raise ValueError("Number of control points doesn't fit the bezier degree")
 
         self.control_points = control_points
         self.joint_points = joint_points
         self.curve = curve
         self.__ctrl_pts_per_section = self.curve.degree - 1
 
-    
-    def evaluate(self, t):
+    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
         """
-            Evaluates the spline at a given parameter `t`.
+        Evaluates the spline at given parameter values `t`.
 
-            Parameters:
-                t (float): The parameter value in the range [0, 1] for spline evaluation.
+        Parameters:
+            t (torch.Tensor): Tensor of parameter values in the range [0, 1].
 
-            Returns:
-                np.ndarray: The point on the spline at the given parameter `t`.
-
-            The method computes the appropriate spline segment using the joint and control points, 
-            then evaluates the curve's position for the calculated segment.
+        Returns:
+            torch.Tensor: Tensor of points on the spline corresponding to `t`.
         """
         epsilon = 1e-10
-        t = min(t, 1.0 - epsilon)
+        t = torch.clamp(t, max=1.0 - epsilon)
 
         u = (len(self.joint_points) - 1) * t
+        point_index = torch.floor(u).long()
+        polynomial_t = u - point_index
 
+        current_control = torch.stack([
+            self.control_points[point_index[i] * self.__ctrl_pts_per_section : (point_index[i] + 1) * self.__ctrl_pts_per_section]
+            for i in range(len(point_index))
+        ])
 
-        point_index, polynomial_t = divmod(u, 1)
-        point_index = int(point_index)
-
-        current_control = self.control_points[point_index * self.__ctrl_pts_per_section : (point_index + 1) * self.__ctrl_pts_per_section]
-
-        return self.curve.evaluate(polynomial_t, np.array([self.joint_points[point_index]] + current_control + [self.joint_points[point_index + 1]]))
+        return self.curve.evaluate(polynomial_t, torch.cat([self.joint_points[point_index].unsqueeze(1), current_control, self.joint_points[point_index + 1].unsqueeze(1)], dim=1))
     
     def get_lines(self):
         lines = []
@@ -63,7 +57,7 @@ class Spline:
         return lines
 
 
-    
 
-        
+
+
 
