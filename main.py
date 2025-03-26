@@ -3,6 +3,7 @@ from GUI.editor import SplineEditor
 import sys
 import torch
 from splines.spline import Spline
+from splines.curve import Bezier
 
 def optimize_spline(spline: Spline, sample_points: torch.Tensor, num_iterations: int = 1000, learning_rate: float = 0.01):
     """
@@ -45,17 +46,21 @@ def optimize_spline(spline: Spline, sample_points: torch.Tensor, num_iterations:
 
     return control_points.detach()
 
+def main():
+    app = QtWidgets.QApplication(sys.argv)
 
-print("creating app")
-app = QtWidgets.QApplication(sys.argv)
-print("app created")
+    joint_points = [(100.0, 200.0), (200.0, 300.0), (300.0, 100.0)]
+    control_points = [(50.0, 150.0), (100.0, 150.0), (400.0, 200.0), (200.0, 200.0)]
 
-print("creating widget")
-# Create and show the main widget
-main_window = SplineEditor()
+    spline = Spline(control_points, joint_points, Bezier(degree=3))
 
-print("widget created")
-main_window.show()
+    # Create and show the main widget
+    main_window = SplineEditor()
 
-# Run the Qt application
-app.exec_()  # Starts the event loop
+    main_window.show()
+
+    # Run the Qt application
+    app.exec_()  # Starts the event loop
+
+if __name__ == 'main':
+    main()

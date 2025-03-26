@@ -1,16 +1,19 @@
 from abc import ABC
 from math import comb
 import numpy as np
+import torch
 class Curve(ABC):
     def __init__(self, degree=3):
-        self.degree = degree
-        self.char_mat = np.eye(self.degree + 1)
+        self.degree: int = degree
+        self.char_mat: torch.Tensor = torch.eye(self.degree + 1)
         if type(self) is Curve:
             raise TypeError("Cannot instansiate Curve. It is an abstract class")
     
     def evaluate(self, t: float, points: np.ndarray):
+        t_powers = torch.pow(t.unsqueeze(1), torch.arange(self.degree + 1, device=t.device).float())
 
-        return np.power(t, np.arange(self.degree+1)).reshape(1, -1) @ self.char_mat @ points.reshape(-1, 2)
+        # Perform matrix multiplication
+        return t_powers @ self.char_mat.to(t.device) @ points
 
 
 
@@ -18,10 +21,10 @@ class Bezier(Curve):
     def __init__(self, degree=3):
         super().__init__(degree)
 
-        self.char_mat: np.ndarray = np.array([
+        self.char_mat: torch.Tensor = torch.tensor([
             [self.bernstein_coeff(row, col) for col in range(degree + 1)] 
             for row in range(degree + 1)
-        ])
+        ], dtype=torch.float32)
 
     
 

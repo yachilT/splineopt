@@ -1,22 +1,18 @@
-import sys
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets
 
 from splines.curve import Bezier
 from splines.spline import Spline
+import torch
 
 
 class SplineEditor(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, spline: Spline):
         super().__init__()
         self.setWindowTitle("Spline Editor")
 
-        self.joint_points = [(100.0, 200.0), (200.0, 300.0), (300.0, 100.0)]
-        self.control_points = [(50.0, 150.0), (100.0, 150.0), (400.0, 200.0), (200.0, 200.0)]
-
-        self.spline = Spline(self.control_points, self.joint_points, Bezier(degree=3))
-
+        self.spline = spline
 
         # Layout and plot widget
         self.plot_layout = QtWidgets.QVBoxLayout(self)
@@ -27,7 +23,7 @@ class SplineEditor(QtWidgets.QWidget):
         self.scatter = DraggableScatter(
             parent_editor=self,
             spots=[{'pos': pt, 'data': i, 'brush': 'r', 'symbol': 'o', 'size': 10}
-                for i, pt in enumerate(self.control_points)]
+                for i, pt in enumerate(self.spline.control_points)]
         )
         self.plot_widget.addItem(self.scatter)
 
@@ -38,7 +34,6 @@ class SplineEditor(QtWidgets.QWidget):
         self.update_spline()
 
     def update_spline(self):
-        self.spline.control_points = self.control_points
         spline_pts = np.vstack([self.spline.evaluate(t) for t in np.linspace(0, 1, 200)])
         self.spline_curve.setData(spline_pts[:, 0], spline_pts[:, 1])
         
@@ -67,7 +62,7 @@ class DraggableScatter(pg.ScatterPlotItem):
             return
 
         # Update the control point with the new position
-        self.parent_editor.control_points[self.dragged_index] = (event.pos().x(), event.pos().y())
+        self.parent_editor.spline.control_points[self.dragged_index] = (event.pos().x(), event.pos().y())
 
         # Update points visually
         self.setData([
