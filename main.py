@@ -1,66 +1,57 @@
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtCore
 from GUI.editor import SplineEditor
 import sys
 import torch
+
 from splines.spline import Spline
 from splines.curve import Bezier
-
-def optimize_spline(spline: Spline, sample_points: torch.Tensor, num_iterations: int = 1000, learning_rate: float = 0.01):
-    """
-    Optimize the spline control points to fit the given sample points.
-
-    Parameters:
-        spline (Spline): The spline object to optimize.
-        sample_points (torch.Tensor): Tensor of sample points, shape (k, 2).
-        num_iterations (int): Number of optimization iterations.
-        learning_rate (float): Learning rate for the optimizer.
-
-    Returns:
-        torch.Tensor: Optimized control points.
-    """
-    # Make control points trainable
-    control_points = spline.control_points
-    control_points.requires_grad = True
-
-    # Define optimizer
-    optimizer = torch.optim.Adam([control_points], lr=learning_rate)
-
-    # Optimization loop
-    for iteration in range(num_iterations):
-        optimizer.zero_grad()
-
-        # Evaluate the spline at evenly spaced parameter values
-        t = torch.linspace(0, 1, len(sample_points), requires_grad=False)
-        spline_points = spline.evaluate(t)
-
-        # Compute the loss (mean squared error between spline points and sample points)
-        loss = torch.mean((spline_points - sample_points) ** 2)
-
-        # Backpropagation
-        loss.backward()
-        optimizer.step()
-
-        # Print progress
-        if iteration % 100 == 0:
-            print(f"Iteration {iteration}, Loss: {loss.item()}")
-
-    return control_points.detach()
+from train.train import Trainer
 
 def main():
+    # Initialize the Qt application
     app = QtWidgets.QApplication(sys.argv)
 
-    joint_points = [(100.0, 200.0), (200.0, 300.0), (300.0, 100.0)]
-    control_points = [(50.0, 150.0), (100.0, 150.0), (400.0, 200.0), (200.0, 200.0)]
+    # Define joint points and control points
+    joint_points = torch.tensor([
+        [100.0, 200.0],
+        [200.0, 300.0],
+        [300.0, 100.0]
+    ], dtype=torch.float32)
 
-    spline = Spline(control_points, joint_points, Bezier(degree=3))
+    control_points = torch.tensor([
+        [-100.0, 50.0],
+        [-130.0, 350.0],
+        [400.0, 200.0],
+        [200.0, 200.0]
+    ], dtype=torch.float32)
 
-    # Create and show the main widget
-    main_window = SplineEditor()
+    # Create a spline object
+    sample_spline = Spline(control_points, joint_points, Bezier(degree=3))
 
-    main_window.show()
+    # Generate sample points from the spline
+    sample_points = Trainer.generate_sample_points(sample_spline, num_points=50, add_noise=True, noise_std=5.0)
+
+    rand_joints = torch.rand((3,2)) * 500
+    rand_controls = torch.rand((4,2)) * 500
+    spline = Spline(rand_controls,
+                    rand_joints,
+                    Bezier(3))
+    
+    # Create the spline editor
+    editor = SplineEditor(spline, sample_points)
+    editor.show()
+
+    # Optimize the spline after 2 seconds
+    def optimize():
+        trainer = Trainer(spline, sample_points, num_iterations=5000, learning_rate=2,editor=editor)
+        trainer.optimize()
+        editor.update_spline()  # Update the editor after optimization
+
+    # Use a timer to delay optimization (e.g., 2 seconds after the editor is shown)
+    QtCore.QTimer.singleShot(2000, optimize)
 
     # Run the Qt application
-    app.exec_()  # Starts the event loop
+    sys.exit(app.exec_())
 
-if __name__ == 'main':
+if __name__ == '__main__':
     main()
