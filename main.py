@@ -47,8 +47,9 @@ def main():
         trainer.optimize()
         editor.update_spline()  # Update the editor after optimization
 
-    # Use a timer to delay optimization (e.g., 2 seconds after the editor is shown)
-    QtCore.QTimer.singleShot(2000, optimize)
+    # # Use a timer to delay optimization (e.g., 2 seconds after the editor is shown)
+    # QtCore.QTimer.singleShot(2000, optimize)
+    optimize()
 
     # Run the Qt application
     sys.exit(app.exec_())
