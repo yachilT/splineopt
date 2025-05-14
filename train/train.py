@@ -28,7 +28,7 @@ class Trainer:
         """
         Optimize the spline control points to fit the sample points.
         """
-        t = torch.linspace(0, 1, len(self.sample_points), requires_grad=False).detach()
+        t = torch.linspace(0, 1, self.sample_points.shape[1], requires_grad=False).detach()
 
         for iteration in range(self.num_iterations):
 
@@ -65,8 +65,10 @@ class Trainer:
         Parameters:
             spline (Spline): The spline object to sample from.
             num_points (int): The number of sample points to generate.
+            batch_size (int): The number of batches to generate.
             add_noise (bool): Whether to add noise to the sample points.
             noise_std (float): Standard deviation of the noise to add.
+            device (str or torch.device): Device for model (e.g., 'cpu', 'cuda').
 
         Returns:
             torch.Tensor: Tensor of sample points, shape (num_points, 2).

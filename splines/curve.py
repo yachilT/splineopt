@@ -10,15 +10,26 @@ class Curve(ABC):
             raise TypeError("Cannot instansiate Curve. It is an abstract class")
     
     def evaluate(self, t_powers: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-
-        num_segments = t_powers.shape[0]
+        """
+        Evaluates the curve at given parameter values `t_powers` and control points `points`.
+        This method performs the matrix multiplication to compute the curve points.
+        The characteristic matrix is used to transform the control points.
+        Parameters:
+            t_powers (torch.Tensor): Tensor of powers of parameter values, shape (batch_size, num_intervals, degree + 1).
+            points (torch.Tensor): Tensor of control points, shape (batch_size, num_intervals, degree + 1, dim).
+            Returns:
+        torch.Tensor: Tensor of points on the curve, shape (batch_size, num_intervals, max_pts_in_interval, dim).
+        """
+        batch_size = t_powers.shape[0]
+        num_intervals = t_powers.shape[1]
 
         # Dynamically create the characteristic matrix tensor by stacking the single slice
-        char_tensor = self.char_mat.to(points.device).repeat(num_segments, 1, 1)
+        char_tensor = self.char_mat.to(points.device).view(1, 1, self.degree+1, self.degree+1).repeat(batch_size, num_intervals, 1, 1)
+
 
         # Perform matrix multiplication
         result = t_powers @ char_tensor @ points
-        return result
+        return result # (batch_size, num_intervals, max_pts_in_interval, dim)
 
 
 

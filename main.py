@@ -11,32 +11,56 @@ def main():
     # Initialize the Qt application
     app = QtWidgets.QApplication(sys.argv)
 
-    # Define joint points and control points
+    batch_size = 2
+
+    # Joint points: (batch_size, 3, 2)
     joint_points = torch.tensor([
-        [100.0, 200.0],
-        [200.0, 300.0],
-        [300.0, 100.0]
+        [  # First spline
+            [100.0, 200.0],
+            [200.0, 300.0],
+            [300.0, 100.0]
+        ],
+        [  # Second spline
+            [50.0, 150.0],
+            [150.0, 250.0],
+            [250.0, 150.0]
+        ]
     ], dtype=torch.float32)
 
+    # Control points: (batch_size, 4, 2)
     control_points = torch.tensor([
-        [-100.0, 50.0],
-        [-130.0, 350.0],
-        [400.0, 200.0],
-        [200.0, 200.0]
+        [  # First spline's control points
+            [-100.0, 50.0],
+            [-130.0, 350.0],
+            [400.0, 200.0],
+            [200.0, 200.0]
+        ],
+        [  # Second spline's control points
+            [40.0, 160.0],
+            [130.0, 260.0],
+            [240.0, 140.0],
+            [260.0, 130.0]
+        ]
     ], dtype=torch.float32)
+
 
     # Create a spline object
-    sample_spline = Spline(control_points, joint_points, Bezier(degree=3))
+    sample_spline = Spline(batch_size, control_points, joint_points, Bezier(degree=3))
 
     # Generate sample points from the spline
     sample_points = Trainer.generate_sample_points(sample_spline, num_points=50, add_noise=True, noise_std=5.0)
 
-    rand_joints = torch.rand((3,2)) * 500
-    rand_controls = torch.rand((4,2)) * 500
-    spline = Spline(rand_controls,
+    rand_joints = torch.rand((2,3,2)) * 500
+    rand_controls = torch.rand((2,4,2)) * 500
+
+
+
+
+    spline = Spline(batch_size, rand_controls,
                     rand_joints,
                     Bezier(3))
     
+
     # Create the spline editor
     editor = SplineEditor(spline, sample_points)
     editor.show()
