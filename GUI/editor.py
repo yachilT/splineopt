@@ -1,6 +1,7 @@
+from typing import Optional
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore # type: ignore
 
 from splines.curve import Bezier
 from splines.spline import Spline
@@ -9,7 +10,7 @@ import torch
 COLORS = ['r', 'g', 'b', 'y', 'c', 'm', 'k']
 
 class SplineEditor(QtWidgets.QWidget):
-    def __init__(self, spline: Spline, sample_points: Spline = None, freeze: bool = False):
+    def __init__(self, spline: Spline, sample_points: Optional[torch.Tensor] = None, freeze: bool = False):
         super().__init__()
         self.setWindowTitle("Spline Editor")
 
@@ -27,7 +28,7 @@ class SplineEditor(QtWidgets.QWidget):
         
         if self.sample_points is not None:
             self.sample_scatter = pg.ScatterPlotItem(
-                pos=sample_points.detach().reshape(-1, 2).numpy(),
+                pos=self.sample_points.detach().reshape(-1, 2).numpy(),
                 brush=pg.mkBrush(255, 255, 0, 120),  # Yellow-ish, semi-transparent
                 size=8,
                 symbol='x'
@@ -144,20 +145,19 @@ class DraggableScatter(pg.ScatterPlotItem):
 
 
     def update_labels(self, points_data):
-        # Remove old labels from the view
         vb = self.getViewBox()
         if vb is not None:
             for label in self.labels:
                 vb.removeItem(label)
 
-        self.labels.clear()
+            self.labels.clear()
 
-        # Add new labels
-        for pos in points_data:
-            label = pg.TextItem(f"({pos[0]:.2f}, {pos[1]:.2f})", anchor=(0.5, -0.5), color='w')
-            label.setPos(pos[0], pos[1])
-            self.labels.append(label)
-            vb.addItem(label)
+            # Add new labels
+            for pos in points_data:
+                label = pg.TextItem(f"({pos[0]:.2f}, {pos[1]:.2f})", anchor=(0.5, -0.5), color='w')
+                label.setPos(pos[0], pos[1])
+                self.labels.append(label)
+                vb.addItem(label)
 
 
 

@@ -85,7 +85,7 @@ class Spline(nn.Module):
         
         return lines
 
-    def create_t_powers_tensor(self, t: torch.Tensor, num_intervals: int, degree: int) -> torch.Tensor:
+    def create_t_powers_tensor(self, t: torch.Tensor, num_intervals: int, degree: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Creates a tensor where each slice corresponds to an interval, and each slice contains
         a matrix where each row is the powers of a `t` value from the same interval.
@@ -110,7 +110,7 @@ class Spline(nn.Module):
 
         # Count how many `t` values belong to each segment
         segment_counts = torch.bincount(point_index, minlength=num_intervals)
-        max_samples_in_interval = segment_counts.max().item()  # Maximum number of `t` values in any segment
+        max_samples_in_interval = int(segment_counts.max().item())  # Maximum number of `t` values in any segment
 
         # Compute offsets for each segment
         segment_offsets = torch.cumsum(segment_counts, dim=0) - segment_counts

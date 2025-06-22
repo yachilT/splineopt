@@ -1,11 +1,12 @@
 import time
+from typing import Optional
 from splines.spline import Spline
 import torch
 from GUI.editor import SplineEditor
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore # type: ignore
 
 class Trainer:
-    def __init__(self, spline: Spline, sample_points: torch.Tensor, num_iterations: int = 1000, learning_rate: float = 0.01, device = None, editor: SplineEditor=None):
+    def __init__(self, spline: Spline, sample_points: torch.Tensor, num_iterations: int = 1000, learning_rate: float = 0.01, device = None, editor: Optional[SplineEditor]=None):
         """
         Initialize the Trainer.
 

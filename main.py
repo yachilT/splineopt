@@ -1,4 +1,4 @@
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets # type: ignore
 from GUI.editor import SplineEditor
 import sys
 import torch
