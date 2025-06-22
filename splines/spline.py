@@ -1,28 +1,51 @@
+from typing import Optional
 import numpy as np
 import torch
 from torch import nn
-from .curve import Curve
+from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, batch_size: int, control_points: torch.Tensor, joint_points: torch.Tensor, curve: Curve):
+    def __init__(self, num_dim: int, num_curves: int, num_intervals: int, control_points: Optional[torch.Tensor] = None, joint_points: Optional[torch.Tensor] = None, curve: Curve = Bezier(degree=3)):
         """
-        Initialize the spline object with control points, joint points, and curve object.
+        Initialize the spline object with num_curves, control points, joint points, and curve object.
         
         Parameters:
+            num_curve (int): Number of curves in the batch.
             control_points (torch.Tensor): Tensor of control points, shape (n, d).
             joint_points (torch.Tensor): Tensor of joint points, shape (m, d).
             curve (Curve): Curve object for evaluating the spline.
         """
         super(Spline, self).__init__()
-        if (len(joint_points) - 1) * (curve.degree - 1) != len(control_points):
-            raise ValueError("Number of control points doesn't fit the bezier degree")
+        self.num_dim = num_dim
+        self.num_curves = num_curves
+        self.num_intervals = num_intervals
+        self.curve = curve
+        self.__ctrl_pts_per_interval = self.curve.degree - 1
 
-        self.batch_size = batch_size
+
+        if (control_points is None) != (joint_points is None):
+            raise ValueError("Both control_points and joint_points must be provided or both must be None")
+        
+        if joint_points is None:
+            joint_points = torch.zeros((num_curves, num_intervals + 1, num_dim), dtype=torch.float32)
+        else:
+            joint_points = joint_points
+
+        if control_points is None:
+            control_points = torch.zeros((num_curves, num_intervals * self.__ctrl_pts_per_interval, num_dim), dtype=torch.float32)
+        else:
+            control_points = control_points
+
+
+        if joint_points.shape != (num_curves, num_intervals + 1, num_dim):
+            raise ValueError(f"joint_points must have shape (num_curves, num_intervals + 1, num_dim), got {self.joint_points.shape}")
+
+        if control_points.shape != (num_curves, num_intervals * self.__ctrl_pts_per_interval, num_dim):
+            raise ValueError(f"control_points must have shape (num_curves, num_intervals * (degree - 1), num_dim), got {self.control_points.shape}")
+
         self.control_points = nn.Parameter(control_points.clone().detach())
         self.joint_points = nn.Parameter(joint_points.clone().detach())
-        self.curve = curve
-        self.__ctrl_pts_per_section = self.curve.degree - 1
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -41,10 +64,10 @@ class Spline(nn.Module):
 
         # Create the tensor of powers of `t` values grouped by segments
         t_powers, valid_locations = self.create_t_powers_tensor(t, num_intervals, self.curve.degree)
-        t_powers = t_powers.unsqueeze(0).repeat(self.batch_size, 1, 1, 1)  # Shape: (batch_size, num_intervals, max_pts_in_interval, degree + 1)
+        t_powers = t_powers.unsqueeze(0).repeat(self.num_curves, 1, 1, 1)  # Shape: (num_curves, num_intervals, max_pts_in_interval, degree + 1)
 
         # Prepare the control points for each segment
-        control_points = self.control_points.view(self.batch_size, num_intervals, self.__ctrl_pts_per_section, dim)
+        control_points = self.control_points.view(self.num_curves, num_intervals, self.__ctrl_pts_per_interval, dim)
         points = torch.cat(
             [
                 self.joint_points[:, :-1].unsqueeze(2),  # Start joint points
@@ -60,10 +83,10 @@ class Spline(nn.Module):
         max_pts_in_interval = result.shape[2]
 
          # Reshape the result to a 3D tensor:
-        result = result.view(self.batch_size, num_intervals * max_pts_in_interval,  dim)
+        result = result.view(self.num_curves, num_intervals * max_pts_in_interval,  dim)
 
         valid_indices = valid_locations[:, 0] * max_pts_in_interval + valid_locations[:, 1] # (N,)
-        valid_indices = valid_indices.unsqueeze(0).expand(self.batch_size, -1) # (batch_size, N)
+        valid_indices = valid_indices.unsqueeze(0).expand(self.num_curves, -1) # (batch_size, N)
         valid_indices = valid_indices.unsqueeze(2).expand(-1, -1, dim) # (batch_size, N, dim)
 
 
@@ -78,10 +101,10 @@ class Spline(nn.Module):
 
         for i in range(self.joint_points.shape[1]):
             if i > 0:
-                lines.append(create_line(i, self.__ctrl_pts_per_section * i - 1))
+                lines.append(create_line(i, self.__ctrl_pts_per_interval * i - 1))
             
             if i < self.joint_points.shape[1] - 1:
-                lines.append(create_line(i, self.__ctrl_pts_per_section * i))
+                lines.append(create_line(i, self.__ctrl_pts_per_interval * i))
         
         return lines
 

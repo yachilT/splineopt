@@ -10,8 +10,9 @@ from train.train import Trainer
 def main():
     # Initialize the Qt application
     app = QtWidgets.QApplication(sys.argv)
-
-    batch_size = 2
+    dims = 2
+    num_curves = 2
+    num_intervals = 2
 
     # Joint points: (batch_size, 3, 2)
     joint_points = torch.tensor([
@@ -45,7 +46,7 @@ def main():
 
 
     # Create a spline object
-    sample_spline = Spline(batch_size, control_points, joint_points, Bezier(degree=3))
+    sample_spline = Spline(dims, num_curves, num_intervals, control_points, joint_points, Bezier(degree=3))
 
     # Generate sample points from the spline
     sample_points = Trainer.generate_sample_points(sample_spline, num_points=50, add_noise=True, noise_std=5.0)
@@ -56,7 +57,7 @@ def main():
 
 
 
-    spline = Spline(batch_size, rand_controls,
+    spline = Spline(dims, num_curves, num_intervals, rand_controls,
                     rand_joints,
                     Bezier(3))
     

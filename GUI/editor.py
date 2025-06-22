@@ -23,7 +23,7 @@ class SplineEditor(QtWidgets.QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_layout.addWidget(self.plot_widget)
 
-        self.draggable_splines = [DraggableSpline(self, spline.joint_points[i, :, :], spline.control_points[i, :, :], spline.get_lines(i), freeze, COLORS[i]) for i in range(spline.batch_size)]
+        self.draggable_splines = [DraggableSpline(self, spline.joint_points[i, :, :], spline.control_points[i, :, :], spline.get_lines(i), freeze, COLORS[i]) for i in range(spline.num_curves)]
 
         
         if self.sample_points is not None:
@@ -76,7 +76,7 @@ class SplineEditor(QtWidgets.QWidget):
     def update_spline(self):
         spline_pts = self.spline(torch.linspace(0.0, 1.0, steps=self.num_steps))
 
-        for i in range(self.spline.batch_size):
+        for i in range(self.spline.num_curves):
             self.draggable_splines[i].update_visuals(
                 joint_points=self.spline.joint_points[i, :, :],
                 control_points=self.spline.control_points[i, :, :],
