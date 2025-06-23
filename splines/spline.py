@@ -49,6 +49,9 @@ class Spline(nn.Module):
         self.control_points = nn.Parameter(control_points.clone().detach())
         self.joint_points = nn.Parameter(joint_points.clone().detach())
 
+        self._control_points_grd = torch.zeros_like(self.control_points, requires_grad=False)
+        self._joint_points_grd = torch.zeros_like(self.joint_points, requires_grad=False)
+
 
     def create_from_pcd(self, pcd: torch.Tensor):
         """
@@ -192,6 +195,20 @@ class Spline(nn.Module):
         valid_locations = torch.stack([point_index, scatter_indices], dim=1)
 
         return t_powers, valid_locations
+    
+
+    def zero_gradient_cache(self):
+        self._control_points_grd.zero_()
+        self._joint_points_grd.zero_()
+
+    def cache_gradient(self):
+        self._control_points_grd += self.control_points.grad.clone()
+        self._joint_points_grd += self.joint_points.grad.clone()
+
+    def set_batch_gradient(self, cnt):
+        ratio = 1 / cnt
+        self._control_points.grad = self._control_points_grd * ratio
+        self._joint_points.grad = self._joint_points_grd * ratio
 
 
 
