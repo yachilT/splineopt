@@ -212,6 +212,64 @@ class Spline(nn.Module):
         ratio = 1 / cnt
         self._control_points.grad = self._control_points_grd * ratio
         self._joint_points.grad = self._joint_points_grd * ratio
+    
+
+    def to_numpy_dict(self, prefix: str = "") -> dict[str, np.ndarray]:
+        """
+        Flattens the spline's control points and joint points into a dictionary
+        of named 1D NumPy arrays for each vertex (spline curve), suitable for
+        structured export (e.g., to PLY format).
+
+        Each control point and joint point is decomposed into per-axis entries,
+        named using the following convention:
+
+            <prefix>ctrl_pt_<axis>_<index>
+            <prefix>joint_pt_<axis>_<index>
+
+        Example (for a 3D spline with 4 control points and 5 joint points):
+            {
+                'joint_pt_x_0': [...], # shape (num_curves,)
+                'joint_pt_y_0': [...],
+                'joint_pt_z_0': [...],
+                'joint_pt_x_1': [...],
+                ...
+                'ctrl_pt_x_0': [...], 
+                'ctrl_pt_y_0': [...],
+                'ctrl_pt_z_0': [...],
+                'ctrl_pt_x_1': [...],
+                ...
+            }
+
+        Parameters:
+            prefix (str): Optional string to prepend to every field name (e.g., "spline_").
+
+        Returns:
+            dict[str, np.ndarray]: A dictionary where keys are attribute names and values are
+                                NumPy arrays of shape (N,), where N is the number of spline curves.
+        """
+        joint = self.joint_points.detach().cpu().numpy()   # shape: (N, num_joint_pts, dim)
+        ctrl = self.control_points.detach().cpu().numpy()  # shape: (N, num_ctrl_pts, dim)
+
+        num_joint_pts= joint.shape[1]
+        num_ctrl_pts= ctrl.shape[1]
+
+        axis_names = ['x', 'y', 'z'][:self.num_dim] # ['x', 'y', 'z'] for 2D or 3D splines
+        result = {}
+
+        # Flatten joint points: joint_pt_x_0, joint_pt_y_0, ...
+        for i in range(num_joint_pts):
+            for d in range(self.num_dim):
+                key = f"{prefix}joint_pt_{axis_names[d]}_{i}"
+                result[key] = joint[:, i, d]
+
+        # Flatten control points: ctrl_pt_x_0, ctrl_pt_y_0, ...
+        for i in range(num_ctrl_pts):
+            for d in range(self.num_dim):
+                key = f"{prefix}ctrl_pt_{axis_names[d]}_{i}"
+                result[key] = ctrl[:, i, d]
+
+        return result
+
 
 
 
