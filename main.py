@@ -46,7 +46,7 @@ def main():
 
 
     # Create a spline object
-    sample_spline = Spline(dims, num_curves, num_intervals, control_points, joint_points, Bezier(degree=3))
+    sample_spline = Spline(dims, num_curves, num_intervals, Bezier(degree=3), joint_points, control_points)
 
     # Generate sample points from the spline
     sample_points = Trainer.generate_sample_points(sample_spline, num_points=50, add_noise=True, noise_std=5.0)
@@ -57,9 +57,7 @@ def main():
 
 
 
-    spline = Spline(dims, num_curves, num_intervals, rand_controls,
-                    rand_joints,
-                    Bezier(3))
+    spline = Spline(dims, num_curves, num_intervals, Bezier(3), rand_joints, rand_controls)
     
 
     # Create the spline editor

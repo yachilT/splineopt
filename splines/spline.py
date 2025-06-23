@@ -6,14 +6,15 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_curves: int, num_intervals: int, control_points: Optional[torch.Tensor] = None, joint_points: Optional[torch.Tensor] = None, curve: Curve = Bezier(degree=3)):
+    def __init__(self, num_dim: int, num_curves: int, num_intervals: int, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
         
         Parameters:
-            num_curve (int): Number of curves in the batch.
-            control_points (torch.Tensor): Tensor of control points, shape (n, d).
-            joint_points (torch.Tensor): Tensor of joint points, shape (m, d).
+            num_dim (int): Number of dimensions for the spline (e.g., 2 for 2D, 3 for 3D).
+            num_curve (int): Number of curves (points that are moving across time).
+            joint_points (torch.Tensor): Tensor of joint points, shape (num_curves, num_intervals + 1, num_dim).
+            control_points (torch.Tensor): Tensor of control points, shape (num_curves, num_intervals * curve.degree - 1, num_dim).
             curve (Curve): Curve object for evaluating the spline.
         """
         super(Spline, self).__init__()
@@ -59,15 +60,13 @@ class Spline(nn.Module):
         """
         epsilon = 1e-10
         t = torch.clamp(t, max=1-epsilon)
-        num_intervals = self.joint_points.shape[1] - 1
-        dim = self.joint_points.shape[2]
 
         # Create the tensor of powers of `t` values grouped by segments
-        t_powers, valid_locations = self.create_t_powers_tensor(t, num_intervals, self.curve.degree)
+        t_powers, valid_locations = self.create_t_powers_tensor(t)
         t_powers = t_powers.unsqueeze(0).repeat(self.num_curves, 1, 1, 1)  # Shape: (num_curves, num_intervals, max_pts_in_interval, degree + 1)
 
         # Prepare the control points for each segment
-        control_points = self.control_points.view(self.num_curves, num_intervals, self.__ctrl_pts_per_interval, dim)
+        control_points = self.control_points.view(self.num_curves, self.num_intervals, self.__ctrl_pts_per_interval, self.num_dim)
         points = torch.cat(
             [
                 self.joint_points[:, :-1].unsqueeze(2),  # Start joint points
@@ -83,11 +82,11 @@ class Spline(nn.Module):
         max_pts_in_interval = result.shape[2]
 
          # Reshape the result to a 3D tensor:
-        result = result.view(self.num_curves, num_intervals * max_pts_in_interval,  dim)
+        result = result.view(self.num_curves, self.num_intervals * max_pts_in_interval,  self.num_dim)
 
         valid_indices = valid_locations[:, 0] * max_pts_in_interval + valid_locations[:, 1] # (N,)
         valid_indices = valid_indices.unsqueeze(0).expand(self.num_curves, -1) # (batch_size, N)
-        valid_indices = valid_indices.unsqueeze(2).expand(-1, -1, dim) # (batch_size, N, dim)
+        valid_indices = valid_indices.unsqueeze(2).expand(-1, -1, self.num_dim) # (batch_size, N, dim)
 
 
 
@@ -108,7 +107,7 @@ class Spline(nn.Module):
         
         return lines
 
-    def create_t_powers_tensor(self, t: torch.Tensor, num_intervals: int, degree: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def create_t_powers_tensor(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Creates a tensor where each slice corresponds to an interval, and each slice contains
         a matrix where each row is the powers of a `t` value from the same interval.
@@ -123,16 +122,16 @@ class Spline(nn.Module):
             torch.Tensor: A tensor of valid locations (interval index, row index) for each `t` value.
         """
         # Compute u and split into integer and fractional parts
-        u = num_intervals * t
+        u = self.num_intervals * t
         point_index = torch.floor(u).long()  # Integer part of `u`
         polynomial_t = u - point_index       # Fractional part of `u`
 
-        last_point_indices = torch.where(point_index == num_intervals)
-        point_index[last_point_indices] = num_intervals - 1
+        last_point_indices = torch.where(point_index == self.num_intervals)
+        point_index[last_point_indices] = self.num_intervals - 1
         polynomial_t[last_point_indices] = 1.0
 
         # Count how many `t` values belong to each segment
-        segment_counts = torch.bincount(point_index, minlength=num_intervals)
+        segment_counts = torch.bincount(point_index, minlength=self.num_intervals)
         max_samples_in_interval = int(segment_counts.max().item())  # Maximum number of `t` values in any segment
 
         # Compute offsets for each segment
@@ -144,8 +143,8 @@ class Spline(nn.Module):
         # print(f"scatter indices: {scatter_indices}")
 
         # Create a tensor to hold the powers of `t`
-        max_degree = degree + 1
-        t_powers = torch.zeros((num_intervals, max_samples_in_interval, max_degree), device=t.device)
+        max_degree = self.curve.degree + 1
+        t_powers = torch.zeros((self.num_intervals, max_samples_in_interval, max_degree), device=t.device)
 
         # Compute powers of `polynomial_t`
         powers = polynomial_t.unsqueeze(1).pow(torch.arange(max_degree, device=t.device).float())
