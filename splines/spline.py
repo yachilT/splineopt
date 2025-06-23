@@ -6,13 +6,14 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_curves: int, num_intervals: int, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None):
+    def __init__(self, num_dim: int, num_intervals: int, num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
         
         Parameters:
             num_dim (int): Number of dimensions for the spline (e.g., 2 for 2D, 3 for 3D).
-            num_curve (int): Number of curves (points that are moving across time).
+            num_intervals (int): Number of intervals in the spline.
+            num_curve (int): Number of curves (points that are moving across time). default is 1.
             joint_points (torch.Tensor): Tensor of joint points, shape (num_curves, num_intervals + 1, num_dim).
             control_points (torch.Tensor): Tensor of control points, shape (num_curves, num_intervals * curve.degree - 1, num_dim).
             curve (Curve): Curve object for evaluating the spline.
@@ -47,6 +48,42 @@ class Spline(nn.Module):
 
         self.control_points = nn.Parameter(control_points.clone().detach())
         self.joint_points = nn.Parameter(joint_points.clone().detach())
+
+
+    def create_from_pcd(self, pcd: torch.Tensor):
+        """
+        Initializes the spline parameters (joint and control points) from a given point cloud.
+
+        This method sets up the initial spline configuration such that the spline curves exactly interpolate 
+        the input point cloud with no deformation, i.e., the spline will always evaluate to the original 
+        point regardless of the input parameter `t ∈ [0, 1]`.
+
+        Specifically:
+        - `joint_points` are initialized by repeating each point across all joint positions.
+        - `control_points` are also initialized by repeating each point across all control point slots 
+        to ensure a stationary spline (i.e., no movement during interpolation).
+
+        Parameters:
+            pcd (torch.Tensor): A tensor of shape (num_curves, num_dim), where each row represents a 
+                                curve's target position in `num_dim`-dimensional space.
+
+        Raises:
+            ValueError: If the dimensionality of the input `pcd` does not match the expected `self.num_dim`.
+        """
+
+        num_curves, num_dim = pcd.shape
+
+        if num_dim != self.num_dim:
+            raise ValueError(f"Point cloud data must be {self.num_dim}D, got {num_dim}D")
+        
+        self.num_curves = num_curves
+
+
+
+        self.joint_points = nn.Parameter(pcd.clone().detach.unsqueeze(1).repeat(1, self.num_intervals + 1, 1))  # Shape: (num_curves, num_intervals + 1, num_dim)
+        self.control_points = nn.Parameter(pcd.clone().detach.unsqueeze(1).repeat(1, self.num_intervals * self.__ctrl_pts_per_interval, 1))  # Shape: (num_curves, num_intervals * (degree - 1), num_dim)
+
+
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
