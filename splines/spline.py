@@ -202,6 +202,9 @@ class Spline(nn.Module):
         self._joint_points_grd.zero_()
 
     def cache_gradient(self):
+        if self.control_points.grad is None or self.joint_points.grad is None:
+            raise ValueError("Gradient cache has not been initialized. Call zero_gradient_cache() first.")
+
         self._control_points_grd += self.control_points.grad.clone()
         self._joint_points_grd += self.joint_points.grad.clone()
 
