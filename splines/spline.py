@@ -6,7 +6,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: int, num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None):
+    def __init__(self, num_dim: int, num_intervals: int, num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
         
@@ -24,6 +24,7 @@ class Spline(nn.Module):
         self.num_intervals = num_intervals
         self.curve = curve
         self.__ctrl_pts_per_interval = self.curve.degree - 1
+        self.name = name
 
 
         if (control_points is None) != (joint_points is None):
@@ -214,7 +215,7 @@ class Spline(nn.Module):
         self._joint_points.grad = self._joint_points_grd * ratio
     
 
-    def to_numpy_dict(self, prefix: str = "") -> dict[str, np.ndarray]:
+    def to_numpy_dict(self) -> dict[str, np.ndarray]:
         """
         Flattens the spline's control points and joint points into a dictionary
         of named 1D NumPy arrays for each vertex (spline curve), suitable for
@@ -259,16 +260,48 @@ class Spline(nn.Module):
         # Flatten joint points: joint_pt_x_0, joint_pt_y_0, ...
         for i in range(num_joint_pts):
             for d in range(self.num_dim):
-                key = f"{prefix}joint_pt_{axis_names[d]}_{i}"
+                key = f"{self.prefix}_joint_pt_{axis_names[d]}_{i}"
                 result[key] = joint[:, i, d]
 
         # Flatten control points: ctrl_pt_x_0, ctrl_pt_y_0, ...
         for i in range(num_ctrl_pts):
             for d in range(self.num_dim):
-                key = f"{prefix}ctrl_pt_{axis_names[d]}_{i}"
+                key = f"{self.prefix_}ctrl_pt_{axis_names[d]}_{i}"
                 result[key] = ctrl[:, i, d]
 
         return result
+    
+
+    def get_optimizable_groups(self, base_lr : float) -> list[dict]:
+        """
+        Returns a list of dictionaries representing optimizable parameter groups for the spline.
+
+        Each group contains parameters for joint points and control points, with a specified learning rate.
+        Needed for setting up the optimizer in PyTorch.
+        Parameters:
+            base_lr (float): Base learning rate for the optimizer.
+            name (str): Prefix to append to the parameter group names.
+
+        Returns:
+            List[Dict]: A list of dictionaries, each containing 'params' and 'lr' keys.
+        """
+        return [
+            { "params": [self.joint_points], "lr": base_lr, "name": f"{self.name}_joint_points" },
+            { "params": [self.control_points], "lr": base_lr, "name": f"{self.name}_control_points" }
+        ]
+    
+
+    def prune(self, params: dict):
+        """
+        Prunes the spline parameters based on the provided dictionary of parameters.
+        This method updates the joint points and control points of the spline using the provided parameters.
+        Parameters:
+            params (dict): A dictionary containing the parameters for the spline, expected to have keys
+                           "{self.name}_joint_points" and "{self.name}_control_points".
+        """
+        self.joint_points = params[f"{self.name}_joint_points"]
+        self.control_points = params[f"{self.name}_control_points"]
+        self.num_curves = self.joint_points.shape[0]
 
 
 
