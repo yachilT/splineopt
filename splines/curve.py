@@ -1,5 +1,8 @@
 from abc import ABC
-from math import comb
+try:
+    from math import comb
+except ImportError:
+    from scipy.special import comb
 import numpy as np
 import torch
 class Curve(ABC):
