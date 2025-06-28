@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 import numpy as np
 import torch
 from torch import nn
@@ -291,10 +291,10 @@ class Spline(nn.Module):
         ]
     
 
-    def prune(self, params: dict):
+    def update_params_(self, params: dict):
         """
-        Prunes the spline parameters based on the provided dictionary of parameters.
-        This method updates the joint points and control points of the spline using the provided parameters.
+        Updates the spline parameters based on the provided dictionary of parameters.
+        Needed for updating parameters from optimizer, during pruning/densification.
         Parameters:
             params (dict): A dictionary containing the parameters for the spline, expected to have keys
                            "{self.name}_joint_points" and "{self.name}_control_points".
@@ -302,6 +302,62 @@ class Spline(nn.Module):
         self.joint_points = params[f"{self.name}_joint_points"]
         self.control_points = params[f"{self.name}_control_points"]
         self.num_curves = self.joint_points.shape[0]
+
+    
+    def clone_and_modify(self, fns: dict[str, Callable[[torch.Tensor], torch.Tensor]]) -> dict:
+        """
+        Clones the spline parameters according to a mask, and applies functions to each parameter.
+
+        Args:
+            fns (dict): Dictionary mapping parameter names ('joint_points', 'control_points') to functions
+                        that take a tensor and return a modified tensor.
+
+        Returns:
+            dict: Updated parameters using the same naming keys as `get_optimizable_groups()`.
+        """
+        updated = {}
+
+        if "joint_points" in fns:
+            updated[f"{self.name}_joint_points"] = fns["joint_points"](self.joint_points)
+        else:
+            updated[f"{self.name}_joint_points"] = self.joint_points.clone()
+
+        if "control_points" in fns:
+            updated[f"{self.name}_control_points"] = fns["control_points"](self.control_points)
+        else:
+            updated[f"{self.name}_control_points"] = self.control_points.clone()
+
+        return updated
+    
+    def create_new_curves(self, initial_points: torch.Tensor) -> dict:
+        """
+        Prepares new spline curves initialized with constant values across time steps,
+        but does NOT update the spline yet. Instead, returns a dictionary of new tensors
+        that should be passed to the optimizer and later applied via update_params().
+
+        Parameters:
+            initial_points (torch.Tensor): Shape (N, D), where N is the number of new curves.
+
+        Returns:
+            dict: {
+                f"{self.name}_joint_points": nn.Parameter,
+                f"{self.name}_control_points": nn.Parameter
+            }
+        """
+        N, D = initial_points.shape
+
+        num_joint = self.num_intervals + 1
+        num_ctrl = self.num_intervals * self.__ctrl_pts_per_interval
+
+        # Expand each point across time for stationary spline initialization
+        new_joint = initial_points.unsqueeze(1).expand(N, num_joint, D).clone()
+        new_ctrl = initial_points.unsqueeze(1).expand(N, num_ctrl, D).clone()
+
+        return {
+            f"{self.name}_joint_points": new_joint,
+            f"{self.name}_control_points": new_ctrl
+        }
+
 
 
 
