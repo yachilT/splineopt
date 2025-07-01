@@ -114,7 +114,7 @@ class Spline(nn.Module):
 
         # Create the tensor of powers of `t` values grouped by segments
         t_powers, valid_locations = self.create_t_powers_tensor(t)
-        t_powers = t_powers.unsqueeze(0).repeat(self.num_curves, 1, 1, 1)  # Shape: (num_curves, num_intervals, max_pts_in_interval, degree + 1)
+        t_powers = t_powers.unsqueeze(0).expand(self.num_curves, -1, -1, -1)  # Shape: (num_curves, num_intervals, max_pts_in_interval, degree + 1)
 
         # Prepare the control points for each segment
         control_points = self.control_points.view(self.num_curves, self.num_intervals, self.__ctrl_pts_per_interval, self.num_dim)
