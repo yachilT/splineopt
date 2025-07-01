@@ -14,27 +14,29 @@ class Curve(ABC):
     
     def evaluate(self, t_powers: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """
-        Evaluates the curve at given parameter values `t_powers` and control points `points`.
-        This method performs the matrix multiplication to compute the curve points.
-        The characteristic matrix is used to transform the control points.
-        Parameters:
-            t_powers (torch.Tensor): Tensor of powers of parameter values, shape (num_curves, num_intervals, max_pts_in_interval, degree + 1).
-            points (torch.Tensor): Tensor of control points, shape (num_curves, num_intervals, degree + 1, dim).
-            Returns:
-        torch.Tensor: Tensor of points on the curve, shape (num_curves, num_intervals, max_pts_in_interval, dim).
+        Evaluates the curve efficiently without per-curve expansion of t_powers or char_tensor.
+        
+        Args:
+            t_powers: (num_intervals, max_pts, D+1)
+            points: (num_curves, num_intervals, D+1, dim)
+        
+        Returns:
+            result: (num_curves, num_intervals, max_pts, dim)
         """
-        num_curves = t_powers.shape[0]
-        num_intervals = t_powers.shape[1]
+        # Apply the characteristic matrix: (max_pts, D+1) @ (D+1, D+1) = (max_pts, D+1)
+        char_mat = self.char_mat.to(points.device)  # (D+1, D+1)
+        t_transformed = t_powers @ char_mat  # (num_intervals, max_pts, D+1)
 
-        # Dynamically create the characteristic matrix tensor by stacking the single slice
+        # Reshape to allow broadcasting:
+        # (1, num_intervals, max_pts, D+1)
+        t_transformed = t_transformed.unsqueeze(0)  # batch dim = 1 for num_curves
 
-        char_tensor = self.char_mat.to(points.device).unsqueeze(0).unsqueeze(0)  # (1, 1, degree+1, degree+1)
-        char_tensor = char_tensor.expand(num_curves, num_intervals, self.degree + 1, self.degree + 1)  # (num_curves, num_intervals, degree+1, degree+1)
+        # points: (num_curves, num_intervals, D+1, dim)
+        # We want: (num_curves, num_intervals, max_pts, dim)
+        result = torch.einsum('bipk,bikd->bipd', t_transformed, points)
 
+        return result
 
-        # Perform matrix multiplication
-        result = t_powers @ char_tensor @ points
-        return result # (batch_size, num_intervals, max_pts_in_interval, dim)
 
 
 
