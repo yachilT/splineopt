@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
@@ -52,8 +52,17 @@ class Spline(nn.Module):
 
         self._control_points_grd = torch.zeros_like(self.control_points, requires_grad=False)
         self._joint_points_grd = torch.zeros_like(self.joint_points, requires_grad=False)
-
-
+  
+    
+    def get_initial_points(self) -> torch.Tensor:
+        """
+        Returns the initial joint points of the spline, which are the positions at t=0.
+        
+        Returns:
+            torch.Tensor: Tensor of shape (num_curves, num_dim) representing the initial joint points.
+        """
+        return self.joint_points[:, 0, :].clone().detach()
+    
     def create_from_pcd(self, pcd: torch.Tensor):
         """
         Initializes the spline parameters (joint and control points) from a given point cloud.
@@ -84,8 +93,8 @@ class Spline(nn.Module):
 
 
 
-        self.joint_points = nn.Parameter(pcd.clone().detach.unsqueeze(1).repeat(1, self.num_intervals + 1, 1))  # Shape: (num_curves, num_intervals + 1, num_dim)
-        self.control_points = nn.Parameter(pcd.clone().detach.unsqueeze(1).repeat(1, self.num_intervals * self.__ctrl_pts_per_interval, 1))  # Shape: (num_curves, num_intervals * (degree - 1), num_dim)
+        self.joint_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.num_intervals + 1, 1))  # Shape: (num_curves, num_intervals + 1, num_dim)
+        self.control_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.num_intervals * self.__ctrl_pts_per_interval, 1))  # Shape: (num_curves, num_intervals * (degree - 1), num_dim)
 
 
 
@@ -99,6 +108,7 @@ class Spline(nn.Module):
         Returns:
             torch.Tensor: Tensor of points on the spline corresponding to `t`.
         """
+        # print(f"before clamp - t shape: {t.shape}, min: {t.min()}, max: {t.max()}")
         epsilon = 1e-10
         t = torch.clamp(t, max=1-epsilon)
 
@@ -133,7 +143,7 @@ class Spline(nn.Module):
 
         return torch.gather(result, dim=1, index=valid_indices).squeeze(1) # (batch_size, N, dim)
     
-    def get_lines(self, batch: int) -> list[np.ndarray]:
+    def get_lines(self, batch: int) -> List[np.ndarray]:
 
         create_line = lambda joint_index, control_index : np.array([self.joint_points[batch, joint_index, :].detach().numpy(), self.control_points[batch, control_index, :].detach().numpy()])
 
@@ -148,7 +158,7 @@ class Spline(nn.Module):
         
         return lines
 
-    def create_t_powers_tensor(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def create_t_powers_tensor(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Creates a tensor where each slice corresponds to an interval, and each slice contains
         a matrix where each row is the powers of a `t` value from the same interval.
@@ -162,6 +172,13 @@ class Spline(nn.Module):
             torch.Tensor: A tensor of shape (num_intervals, max_t_in_segment, degree + 1).
             torch.Tensor: A tensor of valid locations (interval index, row index) for each `t` value.
         """
+        if t.dim() == 2 and t.size(1) == 1:
+            t = t.view(-1)  # flatten to 1D
+        elif t.dim() != 1:
+            raise ValueError(f"Expected 1D or 2D tensor with shape (n,1) for `t`, got {t.shape}")
+    
+        # print(f"t shape: {t.shape}, min: {t.min()}, max: {t.max()}")
+    
         # Compute u and split into integer and fractional parts
         u = self.num_intervals * t
         point_index = torch.floor(u).long()  # Integer part of `u`
@@ -199,8 +216,8 @@ class Spline(nn.Module):
     
 
     def zero_gradient_cache(self):
-        self._control_points_grd.zero_()
-        self._joint_points_grd.zero_()
+        self._control_points_grd = torch.zeros_like(self.control_points, requires_grad=False)
+        self._joint_points_grd = torch.zeros_like(self.joint_points, requires_grad=False)
 
     def cache_gradient(self):
         if self.control_points.grad is None or self.joint_points.grad is None:
@@ -211,11 +228,11 @@ class Spline(nn.Module):
 
     def set_batch_gradient(self, cnt):
         ratio = 1 / cnt
-        self._control_points.grad = self._control_points_grd * ratio
-        self._joint_points.grad = self._joint_points_grd * ratio
+        self.control_points.grad = self._control_points_grd * ratio
+        self.joint_points.grad = self._joint_points_grd * ratio
     
 
-    def to_numpy_dict(self) -> dict[str, np.ndarray]:
+    def to_numpy_dict(self) -> Dict[str, np.ndarray]:
         """
         Flattens the spline's control points and joint points into a dictionary
         of named 1D NumPy arrays for each vertex (spline curve), suitable for
@@ -272,7 +289,7 @@ class Spline(nn.Module):
         return result
     
 
-    def get_optimizable_groups(self, base_lr : float) -> list[dict]:
+    def get_optimizable_groups(self, base_lr : float) -> List[dict]:
         """
         Returns a list of dictionaries representing optimizable parameter groups for the spline.
 
@@ -304,7 +321,7 @@ class Spline(nn.Module):
         self.num_curves = self.joint_points.shape[0]
 
     
-    def clone_and_modify(self, fns: dict[str, Callable[[torch.Tensor], torch.Tensor]]) -> dict:
+    def clone_and_modify(self, fns: Dict[str, Callable[[torch.Tensor], torch.Tensor]]) -> dict:
         """
         Clones the spline parameters according to a mask, and applies functions to each parameter.
 
