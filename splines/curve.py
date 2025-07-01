@@ -18,16 +18,18 @@ class Curve(ABC):
         This method performs the matrix multiplication to compute the curve points.
         The characteristic matrix is used to transform the control points.
         Parameters:
-            t_powers (torch.Tensor): Tensor of powers of parameter values, shape (batch_size, num_intervals, degree + 1).
-            points (torch.Tensor): Tensor of control points, shape (batch_size, num_intervals, degree + 1, dim).
+            t_powers (torch.Tensor): Tensor of powers of parameter values, shape (num_curves, num_intervals, max_pts_in_interval, degree + 1).
+            points (torch.Tensor): Tensor of control points, shape (num_curves, num_intervals, degree + 1, dim).
             Returns:
-        torch.Tensor: Tensor of points on the curve, shape (batch_size, num_intervals, max_pts_in_interval, dim).
+        torch.Tensor: Tensor of points on the curve, shape (num_curves, num_intervals, max_pts_in_interval, dim).
         """
-        batch_size = t_powers.shape[0]
+        num_curves = t_powers.shape[0]
         num_intervals = t_powers.shape[1]
 
         # Dynamically create the characteristic matrix tensor by stacking the single slice
-        char_tensor = self.char_mat.to(points.device).view(1, 1, self.degree+1, self.degree+1).repeat(batch_size, num_intervals, 1, 1)
+
+        char_tensor = self.char_mat.to(points.device).unsqueeze(0).unsqueeze(0)  # (1, 1, degree+1, degree+1)
+        char_tensor = char_tensor.expand(num_curves, num_intervals, self.degree + 1, self.degree + 1)  # (num_curves, num_intervals, degree+1, degree+1)
 
 
         # Perform matrix multiplication
