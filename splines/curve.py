@@ -33,7 +33,7 @@ class Curve(ABC):
 
         # points: (num_curves, num_intervals, D+1, dim)
         # We want: (num_curves, num_intervals, max_pts, dim)
-        result = torch.einsum('bipk,bikd->bipd', t_transformed, points)
+        result =  t_transformed @ points
 
         return result
 
