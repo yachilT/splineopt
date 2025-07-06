@@ -61,7 +61,7 @@ class Spline(nn.Module):
         Returns:
             torch.Tensor: Tensor of shape (num_curves, num_dim) representing the initial joint points.
         """
-        return self.joint_points[:, 0, :].clone().detach()
+        return self.joint_points[:, 0, :] + 0.0 * self.control_points.sum() 
     
     def create_from_pcd(self, pcd: torch.Tensor):
         """
