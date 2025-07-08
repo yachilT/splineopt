@@ -277,13 +277,13 @@ class Spline(nn.Module):
         # Flatten joint points: joint_pt_x_0, joint_pt_y_0, ...
         for i in range(num_joint_pts):
             for d in range(self.num_dim):
-                key = f"{self.prefix}_joint_pt_{axis_names[d]}_{i}"
+                key = f"{self.name}_joint_pt_{axis_names[d]}_{i}"
                 result[key] = joint[:, i, d]
 
         # Flatten control points: ctrl_pt_x_0, ctrl_pt_y_0, ...
         for i in range(num_ctrl_pts):
             for d in range(self.num_dim):
-                key = f"{self.prefix_}ctrl_pt_{axis_names[d]}_{i}"
+                key = f"{self.name}_ctrl_pt_{axis_names[d]}_{i}"
                 result[key] = ctrl[:, i, d]
 
         return result
