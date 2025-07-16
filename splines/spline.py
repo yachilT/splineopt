@@ -374,6 +374,16 @@ class Spline(nn.Module):
             f"{self.name}_joint_points": new_joint,
             f"{self.name}_control_points": new_ctrl
         }
+    
+
+    def mask_curves_bounding_box(self, threshold: float):
+        all_points = torch.cat([self.joint_points, self.control_points], dim=1)  # (N, K, 3)
+        min_xyz = all_points.min(dim=1).values
+        max_xyz = all_points.max(dim=1).values
+        movement_extent = torch.norm(max_xyz - min_xyz, dim=1)  # (N,)
+
+        return movement_extent > threshold
+
 
 
 
