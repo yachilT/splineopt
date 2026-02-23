@@ -319,6 +319,97 @@ class Spline(nn.Module):
         }
 
 
+    def split_intervals(self, split_mask: torch.Tensor, interval_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Split specified intervals of specified curves using De Casteljau bisection at t=0.5.
+
+        For each curve c where split_mask[c] is True, splits the interval at interval_indices[c]
+        into two sub-intervals. The split is geometrically exact using the De Casteljau algorithm,
+        preserving the curve shape while doubling the resolution at the chosen interval.
+
+        Parameters:
+            split_mask (torch.Tensor): bool (C,) — which curves to split
+            interval_indices (torch.Tensor): long (C,) — which interval index to split per curve
+                                             (values ignored where split_mask[c] is False)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - new_joint_points:     (C, new_max_intervals + 1, dim)
+                - new_control_points:   (C, new_max_intervals * (degree-1), dim)
+                - new_intervals_per_curve: (C,) long tensor
+        """
+        C = self.num_curves
+        dim = self.num_dim
+        degree = self.curve.degree
+        k_per = self.__ctrl_pts_per_interval  # = degree - 1
+
+        new_intervals_per_curve = self.intervals_per_curve.clone()
+        new_intervals_per_curve[split_mask] += 1
+        new_max = int(new_intervals_per_curve.max().item())
+
+        jp = self.joint_points.detach()    # (C, old_max+1, dim)
+        cp = self.control_points.detach()  # (C, old_max*k_per, dim)
+
+        new_jp = torch.zeros(C, new_max + 1, dim, dtype=jp.dtype, device=jp.device)
+        new_cp = torch.zeros(C, new_max * k_per, dim, dtype=cp.dtype, device=cp.device)
+
+        for c in range(C):
+            n = int(self.intervals_per_curve[c].item())  # current interval count
+
+            if not split_mask[c]:
+                # Copy active data; padding positions remain zero
+                new_jp[c, :n + 1] = jp[c, :n + 1]
+                new_cp[c, :n * k_per] = cp[c, :n * k_per]
+            else:
+                k = int(interval_indices[c].item())
+                assert 0 <= k < n, f"interval_indices[{c}]={k} out of range [0, {n})"
+
+                # Assemble the degree+1 control polygon points for interval k:
+                #   P[0]       = joint_points[k]       (start joint)
+                #   P[1..d-1]  = control_points[k*k_per .. (k+1)*k_per - 1]
+                #   P[d]       = joint_points[k+1]     (end joint)
+                pts = [jp[c, k]]
+                for i in range(k_per):
+                    pts.append(cp[c, k * k_per + i])
+                pts.append(jp[c, k + 1])
+
+                # De Casteljau pyramid at t=0.5: each level midpoints the previous
+                pyramid = [pts]
+                for r in range(1, degree + 1):
+                    prev = pyramid[-1]
+                    level = [(prev[i] + prev[i + 1]) * 0.5 for i in range(degree + 1 - r)]
+                    pyramid.append(level)
+
+                # Left sub-curve:  pyramid[r][0] for r = 0..degree
+                # Right sub-curve: pyramid[degree-r][r] for r = 0..degree
+                # Shared split joint: pyramid[degree][0]
+                S = pyramid[degree][0]
+                left_ctrl  = [pyramid[r][0] for r in range(1, degree)]      # k_per points
+                right_ctrl = [pyramid[degree - r][r] for r in range(1, degree)]  # k_per points
+
+                # Build new joint points: insert S between positions k and k+1
+                new_jp[c, :k + 1]      = jp[c, :k + 1]
+                new_jp[c, k + 1]       = S
+                new_jp[c, k + 2:n + 2] = jp[c, k + 1:n + 1]
+
+                # Build new control points:
+                #   0 .. k*k_per-1        : unchanged (intervals before k)
+                #   k*k_per .. (k+1)*k_per-1  : left sub-interval ctrl pts
+                #   (k+1)*k_per .. (k+2)*k_per-1: right sub-interval ctrl pts
+                #   (k+2)*k_per ..           : old intervals k+1..n-1 shifted right by one
+                new_cp[c, :k * k_per] = cp[c, :k * k_per]
+                new_cp[c, k * k_per:(k + 1) * k_per] = torch.stack(left_ctrl)
+                new_cp[c, (k + 1) * k_per:(k + 2) * k_per] = torch.stack(right_ctrl)
+
+                old_after_start = (k + 1) * k_per
+                old_after_end   = n * k_per
+                new_after_start = (k + 2) * k_per
+                remaining = old_after_end - old_after_start
+                if remaining > 0:
+                    new_cp[c, new_after_start:new_after_start + remaining] = cp[c, old_after_start:old_after_end]
+
+        return new_jp, new_cp, new_intervals_per_curve
+
     def mask_curves_bounding_box(self, threshold: float):
         all_points = torch.cat([self.joint_points, self.control_points], dim=1)  # (N, K, dim)
         min_xyz = all_points.min(dim=1).values
