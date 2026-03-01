@@ -24,6 +24,53 @@ class Trainer:
         self.learning_rate = learning_rate
         self.optimizer = torch.optim.Adam(self.spline.parameters(), lr=self.learning_rate)
         self.editor = editor
+        if editor is not None:
+            editor.on_params_changed = lambda *args: self.reset_optimizer(*args)
+
+    def reset_optimizer(self, old_jp=None, old_cp=None, split_mask=None, old_max_intervals=None):
+        """Reinitialize the optimizer after a split, preserving Adam moments for unaffected curves."""
+        old_state = self.optimizer.state
+        self.optimizer = torch.optim.Adam(self.spline.parameters(), lr=self.learning_rate)
+
+        # If we have no old state info, or the old param was never stepped, nothing to copy
+        if old_jp is None or old_jp not in old_state:
+            return
+        old_jp_s = old_state[old_jp]
+        old_cp_s = old_state.get(old_cp, {})
+        if 'exp_avg' not in old_jp_s:
+            return
+
+        k_per = self.spline.curve.degree - 1
+        old_jp_cols = old_max_intervals + 1
+        old_cp_cols = old_max_intervals * k_per
+        unaffected = ~split_mask
+
+        new_jp = self.spline.joint_points
+        new_cp = self.spline.control_points
+
+        # Build moment tensors for joint_points, zeroed for split/new curves
+        new_jp_avg = torch.zeros_like(new_jp)
+        new_jp_avg_sq = torch.zeros_like(new_jp)
+        new_jp_avg[unaffected, :old_jp_cols] = old_jp_s['exp_avg'][unaffected, :old_jp_cols]
+        new_jp_avg_sq[unaffected, :old_jp_cols] = old_jp_s['exp_avg_sq'][unaffected, :old_jp_cols]
+
+        # Build moment tensors for control_points
+        new_cp_avg = torch.zeros_like(new_cp)
+        new_cp_avg_sq = torch.zeros_like(new_cp)
+        if 'exp_avg' in old_cp_s:
+            new_cp_avg[unaffected, :old_cp_cols] = old_cp_s['exp_avg'][unaffected, :old_cp_cols]
+            new_cp_avg_sq[unaffected, :old_cp_cols] = old_cp_s['exp_avg_sq'][unaffected, :old_cp_cols]
+
+        self.optimizer.state[new_jp] = {
+            'step': old_jp_s['step'],
+            'exp_avg': new_jp_avg,
+            'exp_avg_sq': new_jp_avg_sq,
+        }
+        self.optimizer.state[new_cp] = {
+            'step': old_jp_s['step'],
+            'exp_avg': new_cp_avg,
+            'exp_avg_sq': new_cp_avg_sq,
+        }
 
     def optimize(self):
         """

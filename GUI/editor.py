@@ -27,6 +27,9 @@ class SplineEditor(QtWidgets.QWidget):
         self._drag_points_type = None  # "joint_points" or "control_points"
         self._drag_point_idx = None
 
+        # Optional callback invoked after split_intervals replaces the parameter tensors
+        self.on_params_changed = None
+
         # Layout and plot widget
         self.plot_layout = QtWidgets.QVBoxLayout(self)
         self.plot_widget = pg.PlotWidget()
@@ -76,6 +79,9 @@ class SplineEditor(QtWidgets.QWidget):
         # Optimization status label
         self.status_label = QtWidgets.QLabel("Iteration: 0 | Loss: 0.0000")
         self.plot_layout.addWidget(self.status_label)
+
+        # Disable pyqtgraph's built-in right-click context menu so our event filter can handle it
+        self.plot_widget.getPlotItem().getViewBox().setMenuEnabled(False)
 
         # Install event filter on the viewport for drag handling
         self.plot_widget.viewport().installEventFilter(self)
@@ -151,6 +157,103 @@ class SplineEditor(QtWidgets.QWidget):
 
         return best
 
+    def _find_nearest_interval(self, pixel_pos: QtCore.QPointF, threshold_px: float = 15.0):
+        """
+        Find the nearest spline interval to a pixel position.
+        Uses segment-based distance (point-to-segment) for reliable detection.
+        Returns (curve_idx, interval_idx) or (None, None).
+        """
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        best_dist = threshold_px
+        best = (None, None)
+        samples_per_interval = 50
+        px, py = pixel_pos.x(), pixel_pos.y()
+
+        def pt_to_widget(pt):
+            sp = vb.mapViewToScene(pg.Point(pt[0].item(), pt[1].item()))
+            wp = self.plot_widget.mapFromScene(sp)
+            return wp.x(), wp.y()
+
+        def seg_dist(ax, ay, bx, by, px, py):
+            """Distance from point (px,py) to segment (ax,ay)-(bx,by)."""
+            dx, dy = bx - ax, by - ay
+            len_sq = dx * dx + dy * dy
+            if len_sq == 0:
+                return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+            return ((px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2) ** 0.5
+
+        for curve_idx in range(self.spline.num_curves):
+            num_intervals_i = int(self.spline.intervals_per_curve[curve_idx].item())
+
+            for k in range(num_intervals_i):
+                t_start = k / num_intervals_i
+                t_end = (k + 1) / num_intervals_i
+                t_samples = torch.linspace(t_start, t_end - 1e-6, samples_per_interval)
+                pts = self.spline(t_samples)[curve_idx]  # (samples, dim)
+
+                # Convert all samples to widget pixel coords
+                widget_pts = [pt_to_widget(pts[i]) for i in range(len(pts))]
+
+                # Check distance to each segment between consecutive samples
+                for i in range(len(widget_pts) - 1):
+                    ax, ay = widget_pts[i]
+                    bx, by = widget_pts[i + 1]
+                    dist = seg_dist(ax, ay, bx, by, px, py)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = (curve_idx, k)
+
+        return best
+
+    def _split_interval(self, curve_idx: int, interval_idx: int):
+        """Call split_intervals for one curve/interval and rebuild the spline and visuals."""
+        from torch import nn
+        C = self.spline.num_curves
+        split_mask = torch.zeros(C, dtype=torch.bool)
+        split_mask[curve_idx] = True
+        interval_indices = torch.zeros(C, dtype=torch.long)
+        interval_indices[curve_idx] = interval_idx
+
+        new_jp, new_cp, new_ipc = self.spline.split_intervals(split_mask, interval_indices)
+
+        # Capture old params before replacement so optimizer can transfer state
+        old_jp_param = self.spline.joint_points
+        old_cp_param = self.spline.control_points
+        old_max_intervals = self.spline.max_intervals
+
+        # Update spline parameters (shapes change so replace the Parameters)
+        self.spline.joint_points = nn.Parameter(new_jp)
+        self.spline.control_points = nn.Parameter(new_cp)
+        self.spline.intervals_per_curve = new_ipc
+        self.spline.max_intervals = int(new_ipc.max().item())
+
+        self._rebuild_draggable_splines()
+        if self.on_params_changed is not None:
+            self.on_params_changed(old_jp_param, old_cp_param, split_mask, old_max_intervals)
+        self.update_spline()
+
+    def _rebuild_draggable_splines(self):
+        """Remove all spline visuals from the plot and recreate them."""
+        for ds in self.draggable_splines:
+            ds.remove_from_plot(self.plot_widget)
+        self.draggable_splines.clear()
+
+        ctrl_per_interval = self.spline.curve.degree - 1
+        for i in range(self.spline.num_curves):
+            num_intervals_i = int(self.spline.intervals_per_curve[i].item())
+            num_valid_joints = num_intervals_i + 1
+            num_valid_ctrls = num_intervals_i * ctrl_per_interval
+
+            self.draggable_splines.append(DraggableSpline(
+                self,
+                curve_index=i,
+                joint_points=self.spline.joint_points[i, :num_valid_joints, :],
+                control_points=self.spline.control_points[i, :num_valid_ctrls, :],
+                lines=self.spline.get_lines(i),
+                color=COLORS[i % len(COLORS)]
+            ))
+
     def eventFilter(self, obj, event):
         if not self.paused or self.freeze:
             return False
@@ -163,6 +266,12 @@ class SplineEditor(QtWidgets.QWidget):
                 self._drag_point_idx = pt_idx
                 # Disable ViewBox panning while dragging a point
                 self.plot_widget.getPlotItem().getViewBox().setMouseEnabled(False, False)
+                return True
+
+        elif event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.RightButton:
+            curve_idx, interval_idx = self._find_nearest_interval(event.pos())
+            if curve_idx is not None:
+                self._split_interval(curve_idx, interval_idx)
                 return True
 
         elif event.type() == QtCore.QEvent.MouseMove and self._drag_curve_idx is not None:
@@ -240,6 +349,21 @@ class DraggableSpline(pg.ScatterPlotItem):
             label.setPos(pos[0], pos[1])
             self.labels.append(label)
             vb.addItem(label)
+
+    def remove_from_plot(self, plot_widget: pg.PlotWidget):
+        """Remove all visual items belonging to this spline from the plot."""
+        # Get ViewBox before removing scatter items, as getViewBox() returns None afterwards
+        vb = self.joint_points_scatter.getViewBox()
+        if vb is not None:
+            for label in self.labels:
+                vb.removeItem(label)
+        self.labels.clear()
+
+        plot_widget.removeItem(self.joint_points_scatter)
+        plot_widget.removeItem(self.control_points_scatter)
+        plot_widget.removeItem(self.spline_curve)
+        for line in self.lines:
+            plot_widget.removeItem(line)
 
     def update_visuals(self, joint_points: torch.Tensor, control_points: torch.Tensor, lines: list[np.ndarray], curve: torch.Tensor):
         """Redraw the spline and its lines."""
