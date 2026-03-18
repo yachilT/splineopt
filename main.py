@@ -57,17 +57,22 @@ def main():
         ]
     ], dtype=torch.float32)
 
-    # Create target spline with varying intervals
-    sample_spline = Spline(dims, intervals_per_curve, num_curves, Bezier(degree=3), joint_points, control_points)
+    # C1 mask: curve 0 has 1 interval (no internal junctions, nothing to constrain).
+    # Curve 1 has 3 intervals; mark joints 1, 2, 3 smooth so C_{1,0} and C_{2,0} are derived.
+    c1_mask = torch.zeros(num_curves, max_intervals + 1, dtype=torch.bool)
+    c1_mask[1, 1:] = True  # joints 1, 2, 3 of curve 1
+
+    # Create target spline with varying intervals and C1 continuity
+    sample_spline = Spline(dims, intervals_per_curve, num_curves, Bezier(degree=3), joint_points, control_points, c1_mask=c1_mask)
 
     # Generate sample points from the target spline
     sample_points = Trainer.generate_sample_points(sample_spline, num_points=50, add_noise=True, noise_std=5.0)
 
-    # Create a random initial spline to optimize (also with varying intervals)
+    # Create a random initial spline to optimize (also with varying intervals and C1)
     rand_joints = torch.rand((2, max_intervals + 1, 2)) * 300 + 50
     rand_controls = torch.rand((2, max_intervals * 2, 2)) * 300 + 50
 
-    spline = Spline(dims, intervals_per_curve, num_curves, Bezier(3), rand_joints, rand_controls)
+    spline = Spline(dims, intervals_per_curve, num_curves, Bezier(3), rand_joints, rand_controls, c1_mask=c1_mask)
 
     # Create the spline editor
     editor = SplineEditor(spline, sample_points)

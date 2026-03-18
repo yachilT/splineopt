@@ -6,7 +6,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -18,6 +18,10 @@ class Spline(nn.Module):
             num_curves (int): Number of curves (points that are moving across time). default is 1.
             joint_points (torch.Tensor): Tensor of joint points, shape (num_curves, max_intervals + 1, num_dim).
             control_points (torch.Tensor): Tensor of control points, shape (num_curves, max_intervals * (degree - 1), num_dim).
+            c1_mask (torch.Tensor, optional): Boolean tensor of shape (num_curves, max_intervals + 1).
+                c1_mask[c, k] = True enforces C1 continuity at junction k of curve c, deriving
+                its first control point as the reflection through the joint. Only internal junctions
+                (1 <= k <= intervals_per_curve[c] - 1) are meaningful. Defaults to all False.
             curve (Curve): Curve object for evaluating the spline.
             name (str): Optional name prefix for parameter groups.
         """
@@ -62,6 +66,14 @@ class Spline(nn.Module):
         # Precompute exponent range for t_powers
         self.register_buffer('_exponents', torch.arange(self.curve.degree + 1, dtype=torch.float32))
 
+        # C1 continuity mask: c1_mask[c, k] = True enforces C1 at junction k of curve c.
+        # Only internal junctions (1 <= k <= intervals_per_curve[c] - 1) are meaningful.
+        if c1_mask is None:
+            c1_mask = torch.zeros(num_curves, self.max_intervals + 1, dtype=torch.bool)
+        if c1_mask.shape != (num_curves, self.max_intervals + 1):
+            raise ValueError(f"c1_mask must have shape ({num_curves}, {self.max_intervals + 1}), got {c1_mask.shape}")
+        self.register_buffer('c1_mask', c1_mask)
+
     # Backward-compatible property
     @property
     def num_intervals(self) -> int:
@@ -97,6 +109,66 @@ class Spline(nn.Module):
         self.joint_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals + 1, 1))
         self.control_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals * self.__ctrl_pts_per_interval, 1))
 
+    def set_c1(self, curve_idx: int, joint_idx: int, enabled: bool = True):
+        """
+        Mark a joint as smooth (C1) or release it.
+
+        A control point C_{k,0} is derived only when BOTH joint k and joint k+1 are
+        marked smooth. Marking a single joint does not derive any control point until
+        its neighbour is also marked.
+
+        Parameters:
+            curve_idx (int): Index of the curve.
+            joint_idx (int): Index of the joint (0 to intervals_per_curve[c]).
+            enabled (bool): True to mark the joint smooth, False to release it.
+        """
+        n = int(self.intervals_per_curve[curve_idx].item())
+        if not (0 <= joint_idx <= n):
+            raise ValueError(f"joint_idx must be in [0, {n}], got {joint_idx}")
+        self.c1_mask[curve_idx, joint_idx] = enabled
+
+    def get_effective_control_points(self) -> torch.Tensor:
+        """
+        Returns control points with C1 continuity constraints applied.
+
+        At each junction k where c1_mask[c, k] is True, the first control point of
+        interval k is derived as the reflection of the previous interval's last control
+        point through the joint:
+            C_{k,0} = 2 * J_k - C_{k-1, last}
+
+        The remaining control points of the interval are unchanged (free).
+
+        Returns:
+            torch.Tensor: Shape (num_curves, max_intervals, degree-1, num_dim).
+        """
+        k_per = self.__ctrl_pts_per_interval
+        C = self.num_curves
+
+        # (C, max_intervals, k_per, dim)
+        raw_cp = self.control_points.view(C, self.max_intervals, k_per, self.num_dim)
+
+        if not self.c1_mask.any():
+            return raw_cp
+
+        result_curves = []
+        for c in range(C):
+            n = int(self.intervals_per_curve[c].item())
+            intervals = []
+            for k in range(self.max_intervals):
+                if k >= 1 and k < n and self.c1_mask[c, k] and self.c1_mask[c, k + 1]:
+                    J_k = self.joint_points[c, k]        # (dim,)
+                    last_prev = raw_cp[c, k - 1, k_per - 1]  # (dim,)
+                    c_k0 = 2.0 * J_k - last_prev         # (dim,) — C1 reflection
+                    if k_per > 1:
+                        derived = torch.cat([c_k0.unsqueeze(0), raw_cp[c, k, 1:]], dim=0)
+                    else:
+                        derived = c_k0.unsqueeze(0)
+                    intervals.append(derived)
+                else:
+                    intervals.append(raw_cp[c, k])
+            result_curves.append(torch.stack(intervals, dim=0))
+        return torch.stack(result_curves, dim=0)
+
     def _assemble_interval_points(self) -> torch.Tensor:
         """
         Assembles the full per-interval control point tensor from joint_points and control_points.
@@ -104,11 +176,11 @@ class Spline(nn.Module):
         Returns:
             torch.Tensor: Shape (C, max_intervals, degree+1, dim)
         """
-        control_points = self.control_points.view(self.num_curves, self.max_intervals, self.__ctrl_pts_per_interval, self.num_dim)
+        effective_cp = self.get_effective_control_points()  # (C, max_intervals, k_per, dim)
         points = torch.cat(
             [
                 self.joint_points[:, :-1].unsqueeze(2),   # Start joint points
-                control_points,                            # Control points
+                effective_cp,                              # Control points (C1-derived where applicable)
                 self.joint_points[:, 1:].unsqueeze(2),    # End joint points
             ],
             dim=2,
@@ -176,17 +248,20 @@ class Spline(nn.Module):
 
     def get_lines(self, batch: int) -> List[np.ndarray]:
         num_intervals = int(self.intervals_per_curve[batch].item())
+        k_per = self.__ctrl_pts_per_interval
 
-        create_line = lambda joint_index, control_index : np.array([self.joint_points[batch, joint_index, :].detach().numpy(), self.control_points[batch, control_index, :].detach().numpy()])
+        eff_cp = self.get_effective_control_points()  # (C, max_intervals, k_per, dim)
 
         lines = []
-
         for i in range(num_intervals + 1):
             if i > 0:
-                lines.append(create_line(i, self.__ctrl_pts_per_interval * i - 1))
-
+                jp = self.joint_points[batch, i, :].detach().numpy()
+                cp = eff_cp[batch, i - 1, k_per - 1].detach().numpy()
+                lines.append(np.array([jp, cp]))
             if i < num_intervals:
-                lines.append(create_line(i, self.__ctrl_pts_per_interval * i))
+                jp = self.joint_points[batch, i, :].detach().numpy()
+                cp = eff_cp[batch, i, 0].detach().numpy()
+                lines.append(np.array([jp, cp]))
 
         return lines
 
@@ -219,7 +294,11 @@ class Spline(nn.Module):
                                 NumPy arrays of shape (N,), where N is the number of spline curves.
         """
         joint = self.joint_points.detach().cpu().numpy()   # shape: (N, max_intervals+1, dim)
-        ctrl = self.control_points.detach().cpu().numpy()   # shape: (N, max_intervals*K, dim)
+
+        # Export effective control points so derived (C1-constrained) slots are correct
+        eff_cp = self.get_effective_control_points()        # (N, max_intervals, k_per, dim)
+        ctrl = eff_cp.reshape(self.num_curves, self.max_intervals * self.__ctrl_pts_per_interval, self.num_dim)
+        ctrl = ctrl.detach().cpu().numpy()
 
         num_joint_pts = joint.shape[1]
         num_ctrl_pts = ctrl.shape[1]
@@ -236,6 +315,11 @@ class Spline(nn.Module):
             for d in range(self.num_dim):
                 key = f"{self.name}_ctrl_pt_{axis_names[d]}_{i}"
                 result[key] = ctrl[:, i, d]
+
+        # Export c1_mask as uint8 (0/1) so it survives round-trips through PLY / numpy
+        c1 = self.c1_mask.cpu().numpy().astype(np.uint8)  # (N, max_intervals+1)
+        for k in range(c1.shape[1]):
+            result[f"{self.name}_c1_joint_{k}"] = c1[:, k]
 
         return result
 
@@ -334,9 +418,12 @@ class Spline(nn.Module):
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - new_joint_points:     (C, new_max_intervals + 1, dim)
-                - new_control_points:   (C, new_max_intervals * (degree-1), dim)
+                - new_joint_points:        (C, new_max_intervals + 1, dim)
+                - new_control_points:      (C, new_max_intervals * (degree-1), dim)
                 - new_intervals_per_curve: (C,) long tensor
+
+            Side effect: self.c1_mask is updated in-place to reflect the inserted junction.
+            The new junction inherits C1 only if both its neighbours were already C1.
         """
         C = self.num_curves
         dim = self.num_dim
@@ -408,6 +495,23 @@ class Spline(nn.Module):
                 if remaining > 0:
                     new_cp[c, new_after_start:new_after_start + remaining] = cp[c, old_after_start:old_after_end]
 
+        # Build shifted c1_mask. The new junction inherits C1 only if both its
+        # neighbours (the original left and right joints of the split interval) are C1.
+        new_c1_mask = torch.zeros(C, new_max + 1, dtype=torch.bool, device=self.c1_mask.device)
+        for c in range(C):
+            n = int(self.intervals_per_curve[c].item())
+            if not split_mask[c]:
+                new_c1_mask[c, :n + 1] = self.c1_mask[c, :n + 1]
+            else:
+                k = int(interval_indices[c].item())
+                # Junctions 0..k are unchanged
+                new_c1_mask[c, :k + 1] = self.c1_mask[c, :k + 1]
+                # New junction k+1: C1 only if both original neighbours were C1
+                new_c1_mask[c, k + 1] = self.c1_mask[c, k] and self.c1_mask[c, k + 1]
+                # Old junctions k+1..n shift right by one to k+2..n+1
+                new_c1_mask[c, k + 2:n + 2] = self.c1_mask[c, k + 1:n + 1]
+
+        self.c1_mask = new_c1_mask
         return new_jp, new_cp, new_intervals_per_curve
 
     def mask_curves_bounding_box(self, threshold: float):

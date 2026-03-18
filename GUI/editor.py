@@ -36,18 +36,20 @@ class SplineEditor(QtWidgets.QWidget):
         self.plot_layout.addWidget(self.plot_widget)
 
         ctrl_per_interval = spline.curve.degree - 1
+        eff_cp = spline.get_effective_control_points()
 
         self.draggable_splines = []
         for i in range(spline.num_curves):
             num_intervals_i = int(spline.intervals_per_curve[i].item())
             num_valid_joints = num_intervals_i + 1
             num_valid_ctrls = num_intervals_i * ctrl_per_interval
+            eff_cp_flat = eff_cp[i, :num_intervals_i].reshape(num_valid_ctrls, spline.num_dim)
 
             self.draggable_splines.append(DraggableSpline(
                 self,
                 curve_index=i,
                 joint_points=spline.joint_points[i, :num_valid_joints, :],
-                control_points=spline.control_points[i, :num_valid_ctrls, :],
+                control_points=eff_cp_flat,
                 lines=spline.get_lines(i),
                 color=COLORS[i % len(COLORS)]
             ))
@@ -103,15 +105,17 @@ class SplineEditor(QtWidgets.QWidget):
     def update_spline(self):
         spline_pts = self.spline(torch.linspace(0.0, 1.0, steps=self.num_steps))
         ctrl_per_interval = self.spline.curve.degree - 1
+        eff_cp = self.spline.get_effective_control_points()
 
         for i in range(self.spline.num_curves):
             num_intervals_i = int(self.spline.intervals_per_curve[i].item())
             num_valid_joints = num_intervals_i + 1
             num_valid_ctrls = num_intervals_i * ctrl_per_interval
+            eff_cp_flat = eff_cp[i, :num_intervals_i].reshape(num_valid_ctrls, self.spline.num_dim)
 
             self.draggable_splines[i].update_visuals(
                 joint_points=self.spline.joint_points[i, :num_valid_joints, :],
-                control_points=self.spline.control_points[i, :num_valid_ctrls, :],
+                control_points=eff_cp_flat,
                 lines=self.spline.get_lines(i),
                 curve=spline_pts[i, :, :]
             )
@@ -143,9 +147,13 @@ class SplineEditor(QtWidgets.QWidget):
                     best_dist = dist
                     best = (curve_idx, "joint_points", j)
 
-            # Check control points
+            # Check control points (use effective positions so derived CPs are hit-testable)
+            eff_cp = self.spline.get_effective_control_points()
+            k_per = self.spline.curve.degree - 1
             for j in range(num_valid_ctrls):
-                pt = self.spline.control_points[curve_idx, j].detach()
+                k = j // k_per
+                pos_in_interval = j % k_per
+                pt = eff_cp[curve_idx, k, pos_in_interval].detach()
                 scene_pt = vb.mapViewToScene(pg.Point(pt[0].item(), pt[1].item()))
                 widget_pt = self.plot_widget.mapFromScene(scene_pt)
                 dx = widget_pt.x() - pixel_pos.x()
@@ -240,16 +248,18 @@ class SplineEditor(QtWidgets.QWidget):
         self.draggable_splines.clear()
 
         ctrl_per_interval = self.spline.curve.degree - 1
+        eff_cp = self.spline.get_effective_control_points()
         for i in range(self.spline.num_curves):
             num_intervals_i = int(self.spline.intervals_per_curve[i].item())
             num_valid_joints = num_intervals_i + 1
             num_valid_ctrls = num_intervals_i * ctrl_per_interval
+            eff_cp_flat = eff_cp[i, :num_intervals_i].reshape(num_valid_ctrls, self.spline.num_dim)
 
             self.draggable_splines.append(DraggableSpline(
                 self,
                 curve_index=i,
                 joint_points=self.spline.joint_points[i, :num_valid_joints, :],
-                control_points=self.spline.control_points[i, :num_valid_ctrls, :],
+                control_points=eff_cp_flat,
                 lines=self.spline.get_lines(i),
                 color=COLORS[i % len(COLORS)]
             ))
@@ -284,7 +294,19 @@ class SplineEditor(QtWidgets.QWidget):
             if self._drag_points_type == "joint_points":
                 self.spline.joint_points.data[self._drag_curve_idx, self._drag_point_idx] = new_coords
             else:
-                self.spline.control_points.data[self._drag_curve_idx, self._drag_point_idx] = new_coords
+                c = self._drag_curve_idx
+                j = self._drag_point_idx
+                k_per = self.spline.curve.degree - 1
+                k = j // k_per
+                # If this is a C1-derived control point, redirect to its free driver
+                if (j % k_per == 0 and k >= 1
+                        and self.spline.c1_mask[c, k]
+                        and self.spline.c1_mask[c, k + 1]):
+                    J_k = self.spline.joint_points.data[c, k]
+                    free_idx = (k - 1) * k_per + (k_per - 1)
+                    self.spline.control_points.data[c, free_idx] = 2.0 * J_k - new_coords
+                else:
+                    self.spline.control_points.data[c, j] = new_coords
 
             self.update_spline()
             return True
