@@ -143,31 +143,55 @@ class Spline(nn.Module):
         """
         k_per = self.__ctrl_pts_per_interval
         C = self.num_curves
+        K = self.max_intervals
+        device = self.control_points.device
 
-        # (C, max_intervals, k_per, dim)
-        raw_cp = self.control_points.view(C, self.max_intervals, k_per, self.num_dim)
+        # (C, K, k_per, dim)
+        raw_cp = self.control_points.view(C, K, k_per, self.num_dim)
 
         if not self.c1_mask.any():
             return raw_cp
 
-        result_curves = []
-        for c in range(C):
-            n = int(self.intervals_per_curve[c].item())
-            intervals = []
-            for k in range(self.max_intervals):
-                if k >= 1 and k < n and self.c1_mask[c, k] and self.c1_mask[c, k + 1]:
-                    J_k = self.joint_points[c, k]        # (dim,)
-                    last_prev = raw_cp[c, k - 1, k_per - 1]  # (dim,)
-                    c_k0 = 2.0 * J_k - last_prev         # (dim,) — C1 reflection
-                    if k_per > 1:
-                        derived = torch.cat([c_k0.unsqueeze(0), raw_cp[c, k, 1:]], dim=0)
-                    else:
-                        derived = c_k0.unsqueeze(0)
-                    intervals.append(derived)
-                else:
-                    intervals.append(raw_cp[c, k])
-            result_curves.append(torch.stack(intervals, dim=0))
-        return torch.stack(result_curves, dim=0)
+        # Vectorized derive mask: derive_mask[c, k] = True when interval k of curve c
+        # has a C1-derived first control point.
+        # Conditions: k >= 1, k < intervals_per_curve[c], c1_mask[c,k], c1_mask[c,k+1]
+        k_range = torch.arange(K, device=device)          # (K,)
+        ipc = self.intervals_per_curve.to(device)          # (C,)
+        interval_valid = k_range.unsqueeze(0) < ipc.unsqueeze(1)   # (C, K)
+        internal       = k_range.unsqueeze(0) >= 1                  # (1, K) → broadcasts
+
+        c1 = self.c1_mask.to(device)              # (C, K+1)
+        left_smooth  = c1[:, :K]                  # (C, K) — c1_mask[c, k]
+        right_smooth = c1[:, 1:]                   # (C, K) — c1_mask[c, k+1]
+
+        derive_mask = internal & interval_valid & left_smooth & right_smooth  # (C, K)
+
+        if not derive_mask.any():
+            return raw_cp
+
+        # Derived first CP: 2 * J_k - C_{k-1, last}
+        # J_k = joint_points[:, k, :]  →  joint_points[:, :K, :]  (C, K, dim)
+        J = self.joint_points[:, :K, :]  # (C, K, dim)
+
+        # C_{k-1, last}: raw_cp[:, k-1, k_per-1, :] for k=1..K-1; dummy zeros for k=0
+        prev_last = torch.cat([
+            torch.zeros(C, 1, self.num_dim, device=device),  # dummy for k=0 (never used)
+            raw_cp[:, :-1, k_per - 1, :],                    # k=1..K-1
+        ], dim=1)  # (C, K, dim)
+
+        c1_first = 2.0 * J - prev_last  # (C, K, dim)
+
+        # Replace raw_cp[:, :, 0, :] where derive_mask is True
+        new_first = torch.where(
+            derive_mask.unsqueeze(-1),  # (C, K, 1) → broadcasts to (C, K, dim)
+            c1_first,
+            raw_cp[:, :, 0, :],
+        )  # (C, K, dim)
+
+        if k_per == 1:
+            return new_first.unsqueeze(2)  # (C, K, 1, dim)
+
+        return torch.cat([new_first.unsqueeze(2), raw_cp[:, :, 1:, :]], dim=2)  # (C, K, k_per, dim)
 
     def _assemble_interval_points(self) -> torch.Tensor:
         """
