@@ -270,6 +270,71 @@ class Spline(nn.Module):
 
         return result
 
+    def derivative(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluates the first derivative (velocity) of the spline w.r.t. the global
+        parameter t in [0, 1].
+
+        Uses the same interval mapping and characteristic matrix as forward(), but
+        replaces t_powers with d_t_powers:
+            d/dt [t^0, t^1, ..., t^D] = [0, 1, 2t, ..., D*t^(D-1)]
+        which is curve-type-agnostic — char_mat handles all curve-specific math.
+        Multiplies by intervals_per_curve (chain rule) to convert local to global.
+
+        Parameters:
+            t (torch.Tensor): Shape (N,) or (N, 1), values in [0, 1].
+
+        Returns:
+            torch.Tensor: Shape (C, N, dim) — velocity on each curve at each query point.
+        """
+        if t.dim() == 2 and t.size(1) == 1:
+            t = t.view(-1)
+        elif t.dim() != 1:
+            raise ValueError(f"Expected 1D or 2D tensor with shape (n,1) for `t`, got {t.shape}")
+
+        N = t.shape[0]
+        device = t.device
+        D = self.curve.degree
+        intervals_f = self.intervals_per_curve.float().to(device)  # (C,)
+
+        # Same interval mapping as forward()
+        u = intervals_f.unsqueeze(1) * t.unsqueeze(0)  # (C, N)
+        interval_idx = torch.floor(u).long()
+        local_t = u - interval_idx.float()
+
+        max_idx = (self.intervals_per_curve.to(device) - 1).unsqueeze(1)
+        clamped = interval_idx > max_idx
+        interval_idx = torch.clamp(interval_idx, max=max_idx.expand_as(interval_idx))
+        local_t = torch.where(clamped, torch.ones_like(local_t), local_t)
+
+        # Derivative t-powers: d/dt[t^i] = i * t^(i-1), with d/dt[t^0] = 0
+        # Computed as: coeffs[i] * local_t^shifted_exps[i]
+        #   coeffs        = [0, 1, 2, ..., D]
+        #   shifted_exps  = [0, 0, 1, ..., D-1]  (index 0 is killed by coeff=0)
+        coeffs = torch.arange(D + 1, dtype=torch.float32, device=device)  # (D+1,)
+        shifted_exps = torch.cat([
+            torch.zeros(1, dtype=torch.float32, device=device),
+            torch.arange(D, dtype=torch.float32, device=device),
+        ])  # (D+1,)
+        d_t_powers = coeffs * local_t.unsqueeze(-1).pow(shifted_exps)  # (C, N, D+1)
+
+        # Apply characteristic matrix (curve-type-specific, same as forward)
+        char_mat = self.curve.char_mat.to(device)
+        t_transformed = d_t_powers @ char_mat  # (C, N, D+1)
+
+        # Gather interval control points (same as forward)
+        points = self._assemble_interval_points()  # (C, max_intervals, D+1, dim)
+        idx = interval_idx.unsqueeze(-1).unsqueeze(-1)
+        idx = idx.expand(-1, -1, D + 1, self.num_dim)
+        gathered_points = torch.gather(points, dim=1, index=idx)  # (C, N, D+1, dim)
+
+        result = torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)  # (C, N, dim)
+
+        # Chain rule: d/dt_global = intervals_per_curve * d/dt_local
+        result = result * intervals_f.view(-1, 1, 1)
+
+        return result
+
     def get_lines(self, batch: int) -> List[np.ndarray]:
         num_intervals = int(self.intervals_per_curve[batch].item())
         k_per = self.__ctrl_pts_per_interval
@@ -537,6 +602,47 @@ class Spline(nn.Module):
 
         self.c1_mask = new_c1_mask
         return new_jp, new_cp, new_intervals_per_curve
+
+    def compute_control_polygon_lengths(self) -> torch.Tensor:
+        """
+        Computes the control polygon length for each interval of each curve as a
+        proxy for arc length.
+
+        Uses effective control points (C1 continuity enforced via
+        get_effective_control_points) so that derived control points at smooth
+        junctions are reflected correctly in the length estimate.
+
+        The control polygon for a degree-d Bezier interval consists of d+1 points:
+            P0 = joint_point[i],  P1..P_{d-1} = control_points,  P_d = joint_point[i+1]
+        Its total chord length  sum_k ||P_{k+1} - P_k||  is an upper bound on the
+        true arc length and is a reliable proxy for how far the Gaussian travels
+        within that interval.
+
+        Returns:
+            torch.Tensor: Shape (num_curves, max_intervals) on the same device as
+                          joint_points.  Padding slots (i >= intervals_per_curve[c])
+                          are set to zero.
+        """
+        # (C, max_intervals, degree+1, dim) — already uses get_effective_control_points
+        points = self._assemble_interval_points()
+
+        # Segment differences along the control polygon: (C, max_intervals, degree, dim)
+        seg_diffs = points[:, :, 1:, :] - points[:, :, :-1, :]
+
+        # Euclidean length of each segment: (C, max_intervals, degree)
+        seg_lengths = seg_diffs.norm(dim=-1)
+
+        # Sum over the degree segments to get total polygon length per interval: (C, max_intervals)
+        arc_lengths = seg_lengths.sum(dim=-1)
+
+        # Zero out padding slots (intervals that don't exist for a given curve)
+        device = arc_lengths.device
+        k_range = torch.arange(self.max_intervals, device=device)  # (max_intervals,)
+        ipc = self.intervals_per_curve.to(device)                   # (C,)
+        valid_mask = k_range.unsqueeze(0) < ipc.unsqueeze(1)        # (C, max_intervals)
+        arc_lengths = arc_lengths * valid_mask.float()
+
+        return arc_lengths
 
     def mask_curves_bounding_box(self, threshold: float):
         all_points = torch.cat([self.joint_points, self.control_points], dim=1)  # (N, K, dim)
