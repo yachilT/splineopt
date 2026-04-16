@@ -194,9 +194,11 @@ class SplineEditor(QtWidgets.QWidget):
         for curve_idx in range(self.spline.num_curves):
             num_intervals_i = int(self.spline.intervals_per_curve[curve_idx].item())
 
+            widths = self.spline.interval_widths[curve_idx]  # (max_intervals,)
+            cum_w = torch.cumsum(widths, dim=0)
             for k in range(num_intervals_i):
-                t_start = k / num_intervals_i
-                t_end = (k + 1) / num_intervals_i
+                t_start = 0.0 if k == 0 else cum_w[k - 1].item()
+                t_end = cum_w[k].item()
                 t_samples = torch.linspace(t_start, t_end - 1e-6, samples_per_interval)
                 pts = self.spline(t_samples)[curve_idx]  # (samples, dim)
 

@@ -6,7 +6,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -22,6 +22,10 @@ class Spline(nn.Module):
                 c1_mask[c, k] = True enforces C1 continuity at junction k of curve c, deriving
                 its first control point as the reflection through the joint. Only internal junctions
                 (1 <= k <= intervals_per_curve[c] - 1) are meaningful. Defaults to all False.
+            interval_widths (torch.Tensor, optional): Float tensor of shape (num_curves, max_intervals).
+                interval_widths[c, k] is the fraction of [0, 1] owned by interval k of curve c.
+                Valid slots for each curve must sum to 1.0. Padding slots should be 0.
+                Defaults to uniform widths (1 / intervals_per_curve[c] for each valid slot).
             curve (Curve): Curve object for evaluating the spline.
             name (str): Optional name prefix for parameter groups.
         """
@@ -73,6 +77,17 @@ class Spline(nn.Module):
         if c1_mask.shape != (num_curves, self.max_intervals + 1):
             raise ValueError(f"c1_mask must have shape ({num_curves}, {self.max_intervals + 1}), got {c1_mask.shape}")
         self.register_buffer('c1_mask', c1_mask)
+
+        # Interval widths: fraction of [0, 1] owned by each interval.
+        # Defaults to uniform (1/n for each valid slot, 0 for padding).
+        if interval_widths is None:
+            interval_widths = torch.zeros(num_curves, self.max_intervals, dtype=torch.float32)
+            for c in range(num_curves):
+                n = int(self.intervals_per_curve[c].item())
+                interval_widths[c, :n] = 1.0 / n
+        if interval_widths.shape != (num_curves, self.max_intervals):
+            raise ValueError(f"interval_widths must have shape ({num_curves}, {self.max_intervals}), got {interval_widths.shape}")
+        self.register_buffer('interval_widths', interval_widths)
 
     # Backward-compatible property
     @property
@@ -211,6 +226,48 @@ class Spline(nn.Module):
         )  # Shape: (C, max_intervals, degree + 1, dim)
         return points
 
+    def map_to_local(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Maps global parameter t in [0, 1] to per-curve (interval_idx, local_t, width).
+
+        Uses cumulative sum of interval_widths to support non-uniform interval spacing.
+
+        Parameters:
+            t (torch.Tensor): Shape (N,), values in [0, 1].
+
+        Returns:
+            Tuple of:
+                - interval_idx (torch.Tensor): Shape (C, N) long — which interval each query falls in.
+                - local_t (torch.Tensor): Shape (C, N) float — local parameter within the interval [0, 1].
+                - widths (torch.Tensor): Shape (C, N) float — width of the interval each query falls in.
+        """
+        device = t.device
+        C = self.num_curves
+        N = t.shape[0]
+
+        w = self.interval_widths.to(device)              # (C, max_intervals)
+        cum_w = torch.cumsum(w, dim=1)                   # (C, max_intervals) — right edges
+
+        # searchsorted: for each curve, find the first interval whose right edge > t
+        # t_expanded: (C, N)
+        t_expanded = t.unsqueeze(0).expand(C, N)
+        interval_idx = torch.searchsorted(cum_w, t_expanded.contiguous())  # (C, N)
+
+        # Clamp to valid range [0, intervals_per_curve[c] - 1]
+        max_idx = (self.intervals_per_curve.to(device) - 1).unsqueeze(1)  # (C, 1)
+        interval_idx = torch.clamp(interval_idx, max=max_idx.expand_as(interval_idx))
+
+        # Left edge of each interval: cum_w shifted right by 1 (0 for k=0)
+        cum_w_padded = torch.cat([torch.zeros(C, 1, device=device), cum_w], dim=1)  # (C, max_intervals+1)
+        left_edges = torch.gather(cum_w_padded, 1, interval_idx)     # (C, N)
+        widths = torch.gather(w, 1, interval_idx)                     # (C, N)
+
+        # Local t: (global_t - left_edge) / width, clamped to [0, 1]
+        local_t = (t_expanded - left_edges) / widths.clamp(min=1e-12)
+        local_t = local_t.clamp(0.0, 1.0)
+
+        return interval_idx, local_t, widths
+
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Evaluates the spline at given parameter values `t`.
@@ -234,21 +291,11 @@ class Spline(nn.Module):
 
         N = t.shape[0]
         device = t.device
-        intervals_f = self.intervals_per_curve.float().to(device)  # (C,)
 
-        # Step 1: Per-curve interval mapping
-        # u[c, n] = intervals_per_curve[c] * t[n]
-        u = intervals_f.unsqueeze(1) * t.unsqueeze(0)  # (C, N)
-        interval_idx = torch.floor(u).long()            # (C, N)
-        local_t = u - interval_idx.float()              # (C, N)
+        # Step 1: Per-curve interval mapping (non-uniform widths)
+        interval_idx, local_t, _widths = self.map_to_local(t)
 
-        # Step 2: Clamp endpoint — when t == 1.0, interval_idx == num_intervals (out of bounds)
-        max_idx = (self.intervals_per_curve.to(device) - 1).unsqueeze(1)  # (C, 1)
-        clamped = interval_idx > max_idx
-        interval_idx = torch.clamp(interval_idx, max=max_idx.expand_as(interval_idx))
-        local_t = torch.where(clamped, torch.ones_like(local_t), local_t)
-
-        # Step 3: Compute t_powers: (C, N, degree+1)
+        # Step 2: Compute t_powers: (C, N, degree+1)
         exponents = self._exponents.to(device)  # (degree+1,)
         t_powers = local_t.unsqueeze(-1).pow(exponents)  # (C, N, degree+1)
 
@@ -279,7 +326,7 @@ class Spline(nn.Module):
         replaces t_powers with d_t_powers:
             d/dt [t^0, t^1, ..., t^D] = [0, 1, 2t, ..., D*t^(D-1)]
         which is curve-type-agnostic — char_mat handles all curve-specific math.
-        Multiplies by intervals_per_curve (chain rule) to convert local to global.
+        Multiplies by 1/width (chain rule) to convert local to global.
 
         Parameters:
             t (torch.Tensor): Shape (N,) or (N, 1), values in [0, 1].
@@ -295,17 +342,9 @@ class Spline(nn.Module):
         N = t.shape[0]
         device = t.device
         D = self.curve.degree
-        intervals_f = self.intervals_per_curve.float().to(device)  # (C,)
 
         # Same interval mapping as forward()
-        u = intervals_f.unsqueeze(1) * t.unsqueeze(0)  # (C, N)
-        interval_idx = torch.floor(u).long()
-        local_t = u - interval_idx.float()
-
-        max_idx = (self.intervals_per_curve.to(device) - 1).unsqueeze(1)
-        clamped = interval_idx > max_idx
-        interval_idx = torch.clamp(interval_idx, max=max_idx.expand_as(interval_idx))
-        local_t = torch.where(clamped, torch.ones_like(local_t), local_t)
+        interval_idx, local_t, widths = self.map_to_local(t)
 
         # Derivative t-powers: d/dt[t^i] = i * t^(i-1), with d/dt[t^0] = 0
         # Computed as: coeffs[i] * local_t^shifted_exps[i]
@@ -330,8 +369,8 @@ class Spline(nn.Module):
 
         result = torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)  # (C, N, dim)
 
-        # Chain rule: d/dt_global = intervals_per_curve * d/dt_local
-        result = result * intervals_f.view(-1, 1, 1)
+        # Chain rule: d/dt_global = (1 / width) * d/dt_local
+        result = result * (1.0 / widths.clamp(min=1e-12)).unsqueeze(-1)
 
         return result
 
@@ -409,6 +448,11 @@ class Spline(nn.Module):
         c1 = self.c1_mask.cpu().numpy().astype(np.uint8)  # (N, max_intervals+1)
         for k in range(c1.shape[1]):
             result[f"{self.name}_c1_joint_{k}"] = c1[:, k]
+
+        # Export interval_widths
+        iw = self.interval_widths.cpu().numpy()  # (N, max_intervals)
+        for k in range(iw.shape[1]):
+            result[f"{self.name}_interval_width_{k}"] = iw[:, k]
 
         return result
 
@@ -525,6 +569,7 @@ class Spline(nn.Module):
 
         jp = self.joint_points.detach()    # (C, old_max+1, dim)
         cp = self.control_points.detach()  # (C, old_max*k_per, dim)
+        eff_cp = self.get_effective_control_points().detach()  # (C, old_max, k_per, dim)
 
         new_jp = torch.zeros(C, new_max + 1, dim, dtype=jp.dtype, device=jp.device)
         new_cp = torch.zeros(C, new_max * k_per, dim, dtype=cp.dtype, device=cp.device)
@@ -540,13 +585,11 @@ class Spline(nn.Module):
                 k = int(interval_indices[c].item())
                 assert 0 <= k < n, f"interval_indices[{c}]={k} out of range [0, {n})"
 
-                # Assemble the degree+1 control polygon points for interval k:
-                #   P[0]       = joint_points[k]       (start joint)
-                #   P[1..d-1]  = control_points[k*k_per .. (k+1)*k_per - 1]
-                #   P[d]       = joint_points[k+1]     (end joint)
+                # Assemble the degree+1 control polygon using EFFECTIVE control points
+                # (C1-derived where applicable) so De Casteljau operates on the true curve.
                 pts = [jp[c, k]]
                 for i in range(k_per):
-                    pts.append(cp[c, k * k_per + i])
+                    pts.append(eff_cp[c, k, i])
                 pts.append(jp[c, k + 1])
 
                 # De Casteljau pyramid at t=0.5: each level midpoints the previous
@@ -584,6 +627,38 @@ class Spline(nn.Module):
                 if remaining > 0:
                     new_cp[c, new_after_start:new_after_start + remaining] = cp[c, old_after_start:old_after_end]
 
+                # --- C1-compatible tangent adjustment (3/4 rule) ---
+                # De Casteljau bisection halves the tangent at external junctions,
+                # but C1 (reflection formula) expects the original tangent length.
+                # We meet in the middle: scale both sides to 3/4 of the original
+                # tangent so that C1 is satisfied at both external junctions.
+                #
+                # At junction k (start): if C1 was deriving interval k's first CP,
+                #   adjust the previous interval's last CP so tangent = 3/4 * V.
+                #   C1 then derives the left sub's first CP to match.
+                c1_at_k = (
+                    k >= 1
+                    and bool(self.c1_mask[c, k].item())
+                    and bool(self.c1_mask[c, k + 1].item())
+                )
+                if c1_at_k:
+                    prev_last = cp[c, (k - 1) * k_per + k_per - 1]
+                    J_k = jp[c, k]
+                    new_cp[c, (k - 1) * k_per + k_per - 1] = (J_k + 3.0 * prev_last) / 4.0
+
+                # At junction k+1 (end): if C1 was deriving old interval k+1's
+                #   first CP, adjust the right sub's last CP so tangent = 3/4 * W.
+                #   C1 then derives the next interval's first CP to match.
+                c1_at_k1 = (
+                    k + 1 >= 1 and k + 1 < n
+                    and bool(self.c1_mask[c, k + 1].item())
+                    and bool(self.c1_mask[c, k + 2].item())
+                )
+                if c1_at_k1:
+                    eff_last_k = eff_cp[c, k, k_per - 1]
+                    J_k1 = jp[c, k + 1]
+                    new_cp[c, (k + 1) * k_per + k_per - 1] = (J_k1 + 3.0 * eff_last_k) / 4.0
+
         # Build shifted c1_mask. The new junction inherits C1 only if both its
         # neighbours (the original left and right joints of the split interval) are C1.
         new_c1_mask = torch.zeros(C, new_max + 1, dtype=torch.bool, device=self.c1_mask.device)
@@ -595,12 +670,45 @@ class Spline(nn.Module):
                 k = int(interval_indices[c].item())
                 # Junctions 0..k are unchanged
                 new_c1_mask[c, :k + 1] = self.c1_mask[c, :k + 1]
-                # New junction k+1: C1 only if both original neighbours were C1
-                new_c1_mask[c, k + 1] = self.c1_mask[c, k] and self.c1_mask[c, k + 1]
+                # New junction k+1: inherit C1 from meaningful neighbours.
+                # Boundary junctions (0 and n) are not meaningful for C1, so:
+                #   - First interval (k=0): inherit from inner neighbour (k+1)
+                #   - Last interval (k=n-1): inherit from inner neighbour (k)
+                #   - Middle interval: AND of both neighbours
+                #   - Single interval (n=1): both are boundaries → False
+                if n == 1:
+                    new_c1_mask[c, k + 1] = False
+                elif k == 0:
+                    new_c1_mask[c, k + 1] = bool(self.c1_mask[c, k + 1].item())
+                elif k == n - 1:
+                    new_c1_mask[c, k + 1] = bool(self.c1_mask[c, k].item())
+                else:
+                    new_c1_mask[c, k + 1] = bool(self.c1_mask[c, k].item()) and bool(self.c1_mask[c, k + 1].item())
                 # Old junctions k+1..n shift right by one to k+2..n+1
                 new_c1_mask[c, k + 2:n + 2] = self.c1_mask[c, k + 1:n + 1]
 
         self.c1_mask = new_c1_mask
+
+        # Build shifted interval_widths: split interval k's width is halved into two.
+        old_w = self.interval_widths  # (C, old_max)
+        new_w = torch.zeros(C, new_max, dtype=old_w.dtype, device=old_w.device)
+        for c in range(C):
+            n = int(self.intervals_per_curve[c].item())
+            if not split_mask[c]:
+                new_w[c, :n] = old_w[c, :n]
+            else:
+                k = int(interval_indices[c].item())
+                # Intervals 0..k-1 are unchanged
+                new_w[c, :k] = old_w[c, :k]
+                # Split interval k into two halves
+                half_w = old_w[c, k] * 0.5
+                new_w[c, k] = half_w
+                new_w[c, k + 1] = half_w
+                # Old intervals k+1..n-1 shift right by one
+                if k + 1 < n:
+                    new_w[c, k + 2:n + 1] = old_w[c, k + 1:n]
+
+        self.interval_widths = new_w
         return new_jp, new_cp, new_intervals_per_curve
 
     def compute_control_polygon_lengths(self) -> torch.Tensor:

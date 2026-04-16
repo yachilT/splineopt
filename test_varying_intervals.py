@@ -172,10 +172,135 @@ def test_single_curve_single_interval():
     print("PASS: single curve single interval")
 
 
+def test_split_preserves_shape():
+    """Splitting an interval should not change the evaluated curve shape."""
+    dims = 2
+    num_curves = 2
+    intervals = torch.tensor([1, 2])
+
+    joint_points = torch.tensor([
+        [[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]],
+        [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+    ], dtype=torch.float32)
+
+    control_points = torch.tensor([
+        [[0.33, 0.5], [0.66, 0.5], [0.0, 0.0], [0.0, 0.0]],
+        [[0.15, 0.5], [0.35, 0.8], [0.65, 0.8], [0.85, 0.5]],
+    ], dtype=torch.float32)
+
+    spline = Spline(dims, intervals, num_curves, Bezier(3), joint_points, control_points)
+
+    t = torch.linspace(0, 1, 200)
+    before = spline(t).detach().clone()
+
+    # Split interval 0 of curve 1
+    split_mask = torch.tensor([False, True])
+    interval_indices = torch.tensor([0, 0])
+    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+
+    # Rebuild spline with new geometry
+    spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
+                      c1_mask=spline.c1_mask, interval_widths=spline.interval_widths)
+
+    after = spline2(t).detach()
+
+    assert torch.allclose(before, after, atol=1e-4), \
+        f"Split changed curve shape! Max diff: {(before - after).abs().max().item()}"
+    print("PASS: split preserves shape")
+
+
+def test_split_preserves_c1_with_tangent_adjustment():
+    """Splitting with C1 active should maintain C1 continuity and have bounded shape deviation."""
+    dims = 2
+    num_curves = 1
+    intervals = torch.tensor([3])
+
+    joint_points = torch.tensor([
+        [[0.0, 0.0], [1.0, 2.0], [2.0, 1.0], [3.0, 3.0]],
+    ], dtype=torch.float32)
+
+    control_points = torch.tensor([
+        [[0.3, 1.0], [0.7, 1.5], [1.3, 2.5], [1.7, 1.5], [2.3, 1.0], [2.7, 2.5]],
+    ], dtype=torch.float32)
+
+    c1_mask = torch.zeros(1, 4, dtype=torch.bool)
+    c1_mask[0, 1:] = True  # C1 at all internal junctions
+
+    spline = Spline(dims, intervals, num_curves, Bezier(3), joint_points, control_points, c1_mask=c1_mask)
+
+    t = torch.linspace(0, 1, 200)
+    before = spline(t).detach().clone()
+
+    split_mask = torch.tensor([True])
+    interval_indices = torch.tensor([1])  # split the middle interval
+    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+
+    spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
+                      c1_mask=spline.c1_mask, interval_widths=spline.interval_widths)
+
+    after = spline2(t).detach()
+
+    # Shape deviation is bounded (3/4 tangent adjustment causes small changes)
+    max_diff = (before - after).abs().max().item()
+    assert max_diff < 0.1, f"Shape deviation too large: {max_diff}"
+
+    # Verify C1 continuity is maintained at all internal junctions:
+    # At each junction, the tangent direction from left and right should match.
+    eff_cp2 = spline2.get_effective_control_points().detach()
+    n2 = int(new_ipc[0].item())
+    k_per = spline2.curve.degree - 1
+    for j in range(1, n2):
+        J = spline2.joint_points[0, j].detach()
+        left_tangent = J - eff_cp2[0, j - 1, k_per - 1]    # from prev interval
+        right_tangent = eff_cp2[0, j, 0] - J                 # from next interval
+        # Directions should match (cross product ≈ 0 for 2D)
+        cross = left_tangent[0] * right_tangent[1] - left_tangent[1] * right_tangent[0]
+        assert abs(cross.item()) < 1e-4, \
+            f"C1 broken at junction {j}: cross product = {cross.item()}"
+
+    print(f"PASS: split preserves C1 with tangent adjustment (max shape diff: {max_diff:.4f})")
+
+
+def test_split_preserves_derivative():
+    """Splitting should not change the derivative (velocity) either."""
+    dims = 2
+    num_curves = 1
+    intervals = torch.tensor([2])
+
+    joint_points = torch.tensor([
+        [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0]],
+    ], dtype=torch.float32)
+
+    control_points = torch.tensor([
+        [[0.3, 1.0], [0.7, 1.5], [1.5, 2.5], [2.5, 1.5]],
+    ], dtype=torch.float32)
+
+    spline = Spline(dims, intervals, num_curves, Bezier(3), joint_points, control_points)
+
+    t = torch.linspace(0.01, 0.99, 100)  # avoid exact endpoints
+    deriv_before = spline.derivative(t).detach().clone()
+
+    split_mask = torch.tensor([True])
+    interval_indices = torch.tensor([1])
+    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+
+    spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
+                      c1_mask=spline.c1_mask, interval_widths=spline.interval_widths)
+
+    deriv_after = spline2.derivative(t).detach()
+
+    assert torch.allclose(deriv_before, deriv_after, atol=1e-3), \
+        f"Split changed derivative! Max diff: {(deriv_before - deriv_after).abs().max().item()}"
+    print("PASS: split preserves derivative")
+
+
 if __name__ == '__main__':
     test_uniform_intervals_backward_compat()
     test_uniform_via_tensor()
     test_varying_intervals()
     test_gradient_flow()
     test_single_curve_single_interval()
+    test_split_preserves_shape()
+    test_split_preserves_c1_with_tangent_adjustment()
+    test_split_preserves_derivative()
     print("\nAll tests passed!")
