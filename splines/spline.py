@@ -484,6 +484,68 @@ class Spline(nn.Module):
         self.control_points = params[f"{self.name}_control_points"]
         self.num_curves = self.joint_points.shape[0]
 
+    def prune_(self, mask: torch.Tensor):
+        """
+        Filter all per-curve metadata buffers in lockstep.
+
+        Owns: intervals_per_curve, c1_mask, interval_widths. Does NOT touch
+        joint_points/control_points — those are nn.Parameters with external
+        optimizer state, so the caller must filter them through the optimizer
+        and then call update_params_().
+
+        Parameters:
+            mask (torch.Tensor): bool tensor of shape (num_curves,). True = keep.
+        """
+        m = mask.cpu()
+        self.intervals_per_curve = self.intervals_per_curve[m]
+        self.c1_mask = self.c1_mask[m]
+        self.interval_widths = self.interval_widths[m]
+
+    def extend_(
+        self,
+        num_added: int,
+        intervals_per_curve: Optional[torch.Tensor] = None,
+        c1_mask: Optional[torch.Tensor] = None,
+        interval_widths: Optional[torch.Tensor] = None,
+    ):
+        """
+        Append metadata rows for newly added curves in lockstep.
+
+        Owns: intervals_per_curve, c1_mask, interval_widths. Does NOT touch
+        joint_points/control_points — those are appended via the optimizer
+        before update_params_() is called.
+
+        Parameters:
+            num_added (int): Number of new curves whose metadata to append.
+            intervals_per_curve (torch.Tensor, optional): long (num_added,).
+                Defaults to max_intervals for each new curve.
+            c1_mask (torch.Tensor, optional): bool (num_added, max_intervals + 1).
+                Defaults to all-False.
+            interval_widths (torch.Tensor, optional): float (num_added, max_intervals).
+                Defaults to uniform widths derived from intervals_per_curve.
+        """
+        if num_added <= 0:
+            return
+
+        if intervals_per_curve is None:
+            intervals_per_curve = torch.full((num_added,), self.max_intervals, dtype=torch.long)
+        intervals_per_curve = intervals_per_curve.to(self.intervals_per_curve.device)
+
+        if c1_mask is None:
+            c1_mask = torch.zeros(num_added, self.max_intervals + 1, dtype=torch.bool)
+        c1_mask = c1_mask.to(self.c1_mask.device)
+
+        if interval_widths is None:
+            interval_widths = torch.zeros(num_added, self.max_intervals, dtype=self.interval_widths.dtype)
+            for i in range(num_added):
+                n = int(intervals_per_curve[i].item())
+                interval_widths[i, :n] = 1.0 / n
+        interval_widths = interval_widths.to(self.interval_widths.device)
+
+        self.intervals_per_curve = torch.cat([self.intervals_per_curve, intervals_per_curve], dim=0)
+        self.c1_mask = torch.cat([self.c1_mask, c1_mask], dim=0)
+        self.interval_widths = torch.cat([self.interval_widths, interval_widths], dim=0)
+
 
     def clone_and_modify(self, fns: Dict[str, Callable[[torch.Tensor], torch.Tensor]]) -> dict:
         """
