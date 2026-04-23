@@ -1,6 +1,6 @@
 import time
 from typing import Optional
-from splines.spline import Spline
+from splines.Spline import Spline
 import torch
 from GUI.editor import SplineEditor
 from PyQt5 import QtWidgets, QtCore # type: ignore

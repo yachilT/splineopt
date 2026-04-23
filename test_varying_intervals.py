@@ -7,7 +7,7 @@ Tests:
 3. Gradient flow: gradients propagate through the new forward pass
 """
 import torch
-from splines.spline import Spline
+from splines.Spline import Spline
 from splines.curve import Bezier
 
 

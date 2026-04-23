@@ -1,4 +1,5 @@
 from typing import Callable, Dict, List, Optional, Tuple, Union
+import json
 import numpy as np
 import torch
 from torch import nn
@@ -456,6 +457,42 @@ class Spline(nn.Module):
 
         return result
 
+
+    def save(self, path: str) -> None:
+        """Serialize the spline to a human-readable JSON file."""
+        data = {
+            "version": 1,
+            "num_dim": self.num_dim,
+            "degree": self.curve.degree,
+            "name": self.name,
+            "num_curves": self.num_curves,
+            "intervals_per_curve": self.intervals_per_curve.tolist(),
+            "joint_points": self.joint_points.detach().cpu().tolist(),
+            "control_points": self.control_points.detach().cpu().tolist(),
+            "c1_mask": self.c1_mask.cpu().tolist(),
+            "interval_widths": self.interval_widths.cpu().tolist(),
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "Spline":
+        """Reconstruct a Spline from a JSON file produced by save()."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        if data.get("version") != 1:
+            raise ValueError(f"Unsupported spline file version: {data.get('version')}")
+        return cls(
+            num_dim=data["num_dim"],
+            num_intervals=torch.tensor(data["intervals_per_curve"], dtype=torch.long),
+            num_curves=data["num_curves"],
+            curve=Bezier(degree=data["degree"]),
+            joint_points=torch.tensor(data["joint_points"], dtype=torch.float32),
+            control_points=torch.tensor(data["control_points"], dtype=torch.float32),
+            c1_mask=torch.tensor(data["c1_mask"], dtype=torch.bool),
+            interval_widths=torch.tensor(data["interval_widths"], dtype=torch.float32),
+            name=data.get("name", ""),
+        )
 
     def get_optimizable_groups(self, base_lr : float) -> List[dict]:
         """

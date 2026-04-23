@@ -4,10 +4,18 @@ import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore, QtGui # type: ignore
 
 from splines.curve import Bezier
-from splines.spline import Spline
+from splines.Spline import Spline
 import torch
 
-COLORS = ['r', 'g', 'b', 'y', 'c', 'm', 'k']
+COLORS = [
+    "#15616d",  # dark red
+    "#ff7d00",  # dark green
+    "#78290f",  # dark blue
+    "#001524",  # dark amber
+    '#00a0a0',  # dark cyan
+    '#a000a0',  # dark magenta
+    '#282828',  # near-black
+]
 
 # Pixel distance threshold for picking a point
 PICK_RADIUS = 15
@@ -33,6 +41,7 @@ class SplineEditor(QtWidgets.QWidget):
         # Layout and plot widget
         self.plot_layout = QtWidgets.QVBoxLayout(self)
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground("#F4F4F4")
         self.plot_layout.addWidget(self.plot_widget)
 
         ctrl_per_interval = spline.curve.degree - 1
@@ -58,7 +67,7 @@ class SplineEditor(QtWidgets.QWidget):
         if self.sample_points is not None:
             self.sample_scatter = pg.ScatterPlotItem(
                 pos=self.sample_points.detach().reshape(-1, 2).numpy(),
-                brush=pg.mkBrush(255, 255, 0, 120),  # Yellow-ish, semi-transparent
+                brush=pg.mkBrush("#78290F"),  # Dark amber
                 size=8,
                 symbol='x'
             )
@@ -72,6 +81,15 @@ class SplineEditor(QtWidgets.QWidget):
         self.slider.setValue(self.num_steps)  # Set default value
         self.slider.valueChanged.connect(self.update_num_steps)  # Connect slider to update method
         self.plot_layout.addWidget(self.slider)
+
+        io_layout = QtWidgets.QHBoxLayout()
+        self.save_button = QtWidgets.QPushButton("Save Spline")
+        self.load_button = QtWidgets.QPushButton("Load Spline")
+        io_layout.addWidget(self.save_button)
+        io_layout.addWidget(self.load_button)
+        self.plot_layout.addLayout(io_layout)
+        self.save_button.clicked.connect(self._on_save_clicked)
+        self.load_button.clicked.connect(self._on_load_clicked)
 
         self.paused = True
         self.pause_button = QtWidgets.QPushButton("Start")
@@ -243,6 +261,22 @@ class SplineEditor(QtWidgets.QWidget):
             self.on_params_changed(old_jp_param, old_cp_param, split_mask, old_max_intervals)
         self.update_spline()
 
+    def _on_save_clicked(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Spline", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if path:
+            self.spline.save(path)
+
+    def _on_load_clicked(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Spline", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if path:
+            self.spline = Spline.load(path)
+            self._rebuild_draggable_splines()
+            self.update_spline()
+
     def _rebuild_draggable_splines(self):
         """Remove all spline visuals from the plot and recreate them."""
         for ds in self.draggable_splines:
@@ -324,25 +358,24 @@ class SplineEditor(QtWidgets.QWidget):
         return False
 
 
-class DraggableSpline(pg.ScatterPlotItem):
-    def __init__(self, parent_plot: SplineEditor, curve_index: int, joint_points: torch.Tensor, control_points: torch.Tensor, lines: list[np.ndarray], color: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+class DraggableSpline:
+    def __init__(self, parent_plot: SplineEditor, curve_index: int, joint_points: torch.Tensor, control_points: torch.Tensor, lines: list[np.ndarray], color: str):
         self.editor = parent_plot
         self.curve_index = curve_index
 
         self.joint_points_scatter = pg.ScatterPlotItem(
-            spots=[{'pos': pt, 'data': i, 'brush': 'g', 'symbol': 's', 'size': 12}
+            spots=[{'pos': pt, 'data': i, 'brush': 'g', 'symbol': 's', 'size': 18}
                    for i, pt in enumerate(joint_points.detach().numpy())]
         )
         self.control_points_scatter = pg.ScatterPlotItem(
-            spots=[{'pos': pt, 'data': i, 'brush': 'r', 'symbol': 'o', 'size': 10}
+            spots=[{'pos': pt, 'data': i, 'brush': 'r', 'symbol': 'o', 'size': 14}
                    for i, pt in enumerate(control_points.detach().numpy())]
         )
 
         parent_plot.plot_widget.addItem(self.joint_points_scatter)
         parent_plot.plot_widget.addItem(self.control_points_scatter)
 
-        # labels
+        self.show_labels = False
         self.labels = []
         self._update_labels(joint_points.detach().numpy(), control_points.detach().numpy())
 
@@ -358,18 +391,21 @@ class DraggableSpline(pg.ScatterPlotItem):
                 vb.removeItem(label)
         self.labels.clear()
 
+        if not self.show_labels:
+            return
+
         vb = self.joint_points_scatter.getViewBox()
         if vb is None:
             return
 
         for pos in joint_data:
-            label = pg.TextItem(f"({pos[0]:.2f}, {pos[1]:.2f})", anchor=(0.5, -0.5), color='w')
+            label = pg.TextItem(f"({pos[0]:.0f}, {pos[1]:.0f})", anchor=(0.5, -0.5), color=(120, 120, 120))
             label.setPos(pos[0], pos[1])
             self.labels.append(label)
             vb.addItem(label)
 
         for pos in control_data:
-            label = pg.TextItem(f"({pos[0]:.2f}, {pos[1]:.2f})", anchor=(0.5, -0.5), color='w')
+            label = pg.TextItem(f"({pos[0]:.0f}, {pos[1]:.0f})", anchor=(0.5, -0.5), color=(120, 120, 120))
             label.setPos(pos[0], pos[1])
             self.labels.append(label)
             vb.addItem(label)
