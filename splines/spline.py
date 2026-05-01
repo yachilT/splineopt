@@ -635,9 +635,9 @@ class Spline(nn.Module):
         }
 
 
-    def split_intervals(self, split_mask: torch.Tensor, interval_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def split_intervals(self, split_mask: torch.Tensor, interval_indices: torch.Tensor, uniform_split: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Split specified intervals of specified curves using De Casteljau bisection at t=0.5.
+        Split specified intervals of specified curves using De Casteljau bisection.
 
         For each curve c where split_mask[c] is True, splits the interval at interval_indices[c]
         into two sub-intervals. The split is geometrically exact using the De Casteljau algorithm,
@@ -647,6 +647,11 @@ class Spline(nn.Module):
             split_mask (torch.Tensor): bool (C,) — which curves to split
             interval_indices (torch.Tensor): long (C,) — which interval index to split per curve
                                              (values ignored where split_mask[c] is False)
+            uniform_split (bool): if True, choose the bisection parameter so that the new joint
+                lands on the closest uniform-grid t-position {i/(n+1)} inside the chosen interval,
+                set all interval widths of split curves to 1/(n+1), and equalize tangent magnitudes
+                across the new internal joint to preserve C1 there. If False, bisect at t=0.5
+                (current behaviour: exact curve preservation, half-width split).
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -673,6 +678,11 @@ class Spline(nn.Module):
         new_jp = torch.zeros(C, new_max + 1, dim, dtype=jp.dtype, device=jp.device)
         new_cp = torch.zeros(C, new_max * k_per, dim, dtype=cp.dtype, device=cp.device)
 
+        # Track per-curve local-t actually used (needed for the width update below).
+        local_t_per_curve = [0.5] * C
+
+        old_w = self.interval_widths  # used for grid-aligned t computation in uniform mode
+
         for c in range(C):
             n = int(self.intervals_per_curve[c].item())  # current interval count
 
@@ -684,6 +694,35 @@ class Spline(nn.Module):
                 k = int(interval_indices[c].item())
                 assert 0 <= k < n, f"interval_indices[{c}]={k} out of range [0, {n})"
 
+                # Pick the local-t for the bisection.
+                #   uniform_split=False: t=0.5 (current behaviour, exact curve preservation).
+                #   uniform_split=True:  choose t so the new joint lands on the closest
+                #     uniform-grid position i/(n+1) inside the chosen interval. If no
+                #     grid point falls strictly inside, fall back to t=0.5.
+                if uniform_split:
+                    t_left = float(old_w[c, :k].sum().item()) if k > 0 else 0.0
+                    t_right = t_left + float(old_w[c, k].item())
+                    target_n = n + 1
+                    interval_mid = 0.5 * (t_left + t_right)
+                    best_i = None
+                    best_dist = float("inf")
+                    for i in range(1, target_n):
+                        g = i / target_n
+                        if t_left < g < t_right:
+                            d = abs(g - interval_mid)
+                            if d < best_dist:
+                                best_dist = d
+                                best_i = i
+                    if best_i is not None:
+                        target_global = best_i / target_n
+                        denom = max(t_right - t_left, 1e-9)
+                        local_t = (target_global - t_left) / denom
+                    else:
+                        local_t = 0.5
+                else:
+                    local_t = 0.5
+                local_t_per_curve[c] = local_t
+
                 # Assemble the degree+1 control polygon using EFFECTIVE control points
                 # (C1-derived where applicable) so De Casteljau operates on the true curve.
                 pts = [jp[c, k]]
@@ -691,11 +730,12 @@ class Spline(nn.Module):
                     pts.append(eff_cp[c, k, i])
                 pts.append(jp[c, k + 1])
 
-                # De Casteljau pyramid at t=0.5: each level midpoints the previous
+                # De Casteljau pyramid at parameter local_t.
                 pyramid = [pts]
+                one_minus_t = 1.0 - local_t
                 for r in range(1, degree + 1):
                     prev = pyramid[-1]
-                    level = [(prev[i] + prev[i + 1]) * 0.5 for i in range(degree + 1 - r)]
+                    level = [one_minus_t * prev[i] + local_t * prev[i + 1] for i in range(degree + 1 - r)]
                     pyramid.append(level)
 
                 # Left sub-curve:  pyramid[r][0] for r = 0..degree
@@ -726,15 +766,12 @@ class Spline(nn.Module):
                 if remaining > 0:
                     new_cp[c, new_after_start:new_after_start + remaining] = cp[c, old_after_start:old_after_end]
 
-                # --- C1-compatible tangent adjustment (3/4 rule) ---
-                # De Casteljau bisection halves the tangent at external junctions,
-                # but C1 (reflection formula) expects the original tangent length.
-                # We meet in the middle: scale both sides to 3/4 of the original
-                # tangent so that C1 is satisfied at both external junctions.
-                #
-                # At junction k (start): if C1 was deriving interval k's first CP,
-                #   adjust the previous interval's last CP so tangent = 3/4 * V.
-                #   C1 then derives the left sub's first CP to match.
+                # --- C1-compatible tangent adjustment at external junctions ---
+                # De Casteljau at parameter t scales the left sub's tangent at junction k
+                # to t * V_orig and the right sub's tangent at junction k+1 to (1-t) * W_orig.
+                # C1 (reflection) expects the original tangent length on the neighbour side.
+                # We meet in the middle: target scale = (1 + t)/2 on the left side and
+                # 1 - t/2 on the right side. At t=0.5 both reduce to 3/4 (the original rule).
                 c1_at_k = (
                     k >= 1
                     and bool(self.c1_mask[c, k].item())
@@ -743,11 +780,9 @@ class Spline(nn.Module):
                 if c1_at_k:
                     prev_last = cp[c, (k - 1) * k_per + k_per - 1]
                     J_k = jp[c, k]
-                    new_cp[c, (k - 1) * k_per + k_per - 1] = (J_k + 3.0 * prev_last) / 4.0
+                    s_left = (1.0 + local_t) * 0.5
+                    new_cp[c, (k - 1) * k_per + k_per - 1] = (1.0 - s_left) * J_k + s_left * prev_last
 
-                # At junction k+1 (end): if C1 was deriving old interval k+1's
-                #   first CP, adjust the right sub's last CP so tangent = 3/4 * W.
-                #   C1 then derives the next interval's first CP to match.
                 c1_at_k1 = (
                     k + 1 >= 1 and k + 1 < n
                     and bool(self.c1_mask[c, k + 1].item())
@@ -756,7 +791,20 @@ class Spline(nn.Module):
                 if c1_at_k1:
                     eff_last_k = eff_cp[c, k, k_per - 1]
                     J_k1 = jp[c, k + 1]
-                    new_cp[c, (k + 1) * k_per + k_per - 1] = (J_k1 + 3.0 * eff_last_k) / 4.0
+                    s_right = 1.0 - 0.5 * local_t
+                    new_cp[c, (k + 1) * k_per + k_per - 1] = (1.0 - s_right) * J_k1 + s_right * eff_last_k
+
+                # --- C1 fix at the new internal joint S ---
+                # De Casteljau leaves the two sub-tangents at S colinear, but with magnitudes
+                # t * |V| and (1-t) * |V| (equal only when t=0.5). Equalise them by replacing
+                # the two adjacent control points with reflections of their average tangent
+                # across S. At t=0.5 this is a no-op so we skip it for the non-uniform path.
+                if uniform_split and abs(local_t - 0.5) > 1e-12:
+                    L = new_cp[c, (k + 1) * k_per - 1].clone()
+                    R = new_cp[c, (k + 1) * k_per].clone()
+                    avg_tangent = (R - L) * 0.5
+                    new_cp[c, (k + 1) * k_per - 1] = S - avg_tangent
+                    new_cp[c, (k + 1) * k_per]     = S + avg_tangent
 
         # Build shifted c1_mask. The new junction inherits C1 only if both its
         # neighbours (the original left and right joints of the split interval) are C1.
@@ -788,24 +836,34 @@ class Spline(nn.Module):
 
         self.c1_mask = new_c1_mask
 
-        # Build shifted interval_widths: split interval k's width is halved into two.
-        old_w = self.interval_widths  # (C, old_max)
+        # Build shifted interval_widths.
+        #   uniform_split=False: split interval k into two pieces sized by local_t,
+        #     keeping all other widths unchanged (geometrically consistent with the
+        #     De Casteljau bisection — at t=0.5 this matches the original half-split).
+        #   uniform_split=True:  set every interval of split curves to 1/(n+1), making
+        #     the global parameterisation uniform at the cost of remapping the
+        #     existing (unaffected) intervals' t-budgets.
         new_w = torch.zeros(C, new_max, dtype=old_w.dtype, device=old_w.device)
         for c in range(C):
             n = int(self.intervals_per_curve[c].item())
             if not split_mask[c]:
                 new_w[c, :n] = old_w[c, :n]
             else:
-                k = int(interval_indices[c].item())
-                # Intervals 0..k-1 are unchanged
-                new_w[c, :k] = old_w[c, :k]
-                # Split interval k into two halves
-                half_w = old_w[c, k] * 0.5
-                new_w[c, k] = half_w
-                new_w[c, k + 1] = half_w
-                # Old intervals k+1..n-1 shift right by one
-                if k + 1 < n:
-                    new_w[c, k + 2:n + 1] = old_w[c, k + 1:n]
+                if uniform_split:
+                    new_n = n + 1
+                    new_w[c, :new_n] = 1.0 / new_n
+                else:
+                    k = int(interval_indices[c].item())
+                    t = local_t_per_curve[c]
+                    # Intervals 0..k-1 are unchanged
+                    new_w[c, :k] = old_w[c, :k]
+                    # Split interval k by local_t (at t=0.5 this is the original half-split)
+                    w_k = old_w[c, k]
+                    new_w[c, k]     = w_k * t
+                    new_w[c, k + 1] = w_k * (1.0 - t)
+                    # Old intervals k+1..n-1 shift right by one
+                    if k + 1 < n:
+                        new_w[c, k + 2:n + 1] = old_w[c, k + 1:n]
 
         self.interval_widths = new_w
         return new_jp, new_cp, new_intervals_per_curve
