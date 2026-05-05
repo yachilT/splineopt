@@ -243,7 +243,7 @@ class SplineEditor(QtWidgets.QWidget):
         interval_indices = torch.zeros(C, dtype=torch.long)
         interval_indices[curve_idx] = interval_idx
 
-        new_jp, new_cp, new_ipc = self.spline.split_intervals(split_mask, interval_indices)
+        new_jp, new_cp, new_ipc, _new_g1_scale = self.spline.split_intervals(split_mask, interval_indices)
 
         # Capture old params before replacement so optimizer can transfer state
         old_jp_param = self.spline.joint_points

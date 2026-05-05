@@ -196,7 +196,7 @@ def test_split_preserves_shape():
     # Split interval 0 of curve 1
     split_mask = torch.tensor([False, True])
     interval_indices = torch.tensor([0, 0])
-    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+    new_jp, new_cp, new_ipc, _new_g1_scale = spline.split_intervals(split_mask, interval_indices)
 
     # Rebuild spline with new geometry
     spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
@@ -233,7 +233,7 @@ def test_split_preserves_c1_with_tangent_adjustment():
 
     split_mask = torch.tensor([True])
     interval_indices = torch.tensor([1])  # split the middle interval
-    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+    new_jp, new_cp, new_ipc, _new_g1_scale = spline.split_intervals(split_mask, interval_indices)
 
     spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
                       c1_mask=spline.c1_mask, interval_widths=spline.interval_widths)
@@ -282,7 +282,7 @@ def test_split_preserves_derivative():
 
     split_mask = torch.tensor([True])
     interval_indices = torch.tensor([1])
-    new_jp, new_cp, new_ipc = spline.split_intervals(split_mask, interval_indices)
+    new_jp, new_cp, new_ipc, _new_g1_scale = spline.split_intervals(split_mask, interval_indices)
 
     spline2 = Spline(dims, new_ipc, num_curves, Bezier(3), new_jp, new_cp,
                       c1_mask=spline.c1_mask, interval_widths=spline.interval_widths)
