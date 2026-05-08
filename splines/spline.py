@@ -7,7 +7,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -36,6 +36,10 @@ class Spline(nn.Module):
         self.curve = curve
         self.__ctrl_pts_per_interval = self.curve.degree - 1
         self.name = name
+        self.trainable_widths = bool(trainable_widths)
+        # Sentinel value for padding slots in _width_logits. exp(-1e9) ~ 0, so masked
+        # softmax over a row puts ~0 mass on padding regardless of its other entries.
+        self._WIDTH_LOGIT_PAD = -1e9
 
         # Handle num_intervals: int (uniform) or tensor (per-curve)
         if isinstance(num_intervals, int):
@@ -112,13 +116,75 @@ class Spline(nn.Module):
                 interval_widths[c, :n] = 1.0 / n
         if interval_widths.shape != (num_curves, self.max_intervals):
             raise ValueError(f"interval_widths must have shape ({num_curves}, {self.max_intervals}), got {interval_widths.shape}")
-        self.register_buffer('interval_widths', interval_widths)
+        # Storage routes through one of two slots, exposed via the `interval_widths` property:
+        #   - baseline mode: a buffer (`_interval_widths_buf`) holding the widths verbatim.
+        #   - trainable mode: a Parameter (`_width_logits`) whose masked softmax produces widths.
+        # The property returns the currently-active widths tensor, so all read sites are agnostic.
+        if self.trainable_widths:
+            self._width_logits = nn.Parameter(self._widths_to_logits(interval_widths))
+            # Backward hook zeros padding-slot grads. Padding logits are anchored at -1e9 so
+            # the softmax Jacobian already feeds them ~0; this is belt-and-suspenders.
+            self._width_logits.register_hook(self._width_logits_grad_hook)
+        else:
+            self.register_buffer('_interval_widths_buf', interval_widths)
 
     # Backward-compatible property
     @property
     def num_intervals(self) -> int:
         """Returns max_intervals for backward compatibility."""
         return self.max_intervals
+
+    def _padding_mask(self, device=None) -> torch.Tensor:
+        """Bool tensor (num_curves, max_intervals) — True where the slot is padding (k >= n_c)."""
+        if device is None:
+            device = self.intervals_per_curve.device
+        k_range = torch.arange(self.max_intervals, device=device)
+        ipc = self.intervals_per_curve.to(device)
+        return k_range.unsqueeze(0) >= ipc.unsqueeze(1)
+
+    def _widths_to_logits(self, widths: torch.Tensor) -> torch.Tensor:
+        """Convert a widths tensor (rows sum to 1 over valid slots, 0 in padding) into
+        logits compatible with masked-softmax: log(width.clamp(min=eps)) on valid slots,
+        sentinel padding value elsewhere. Softmax of these logits reproduces `widths`
+        exactly because softmax is shift-invariant and the padding sentinel pushes
+        padding mass to ~0."""
+        eps = 1e-12
+        pad = self._padding_mask(device=widths.device)
+        logits = torch.log(widths.clamp(min=eps))
+        return torch.where(pad, torch.full_like(logits, self._WIDTH_LOGIT_PAD), logits)
+
+    def _width_logits_grad_hook(self, grad: torch.Tensor) -> torch.Tensor:
+        """Zero gradients at padding slots. Robust to topology changes via _padding_mask
+        recomputation."""
+        pad = self._padding_mask(device=grad.device)
+        return grad.masked_fill(pad, 0.0)
+
+    @property
+    def interval_widths(self) -> torch.Tensor:
+        """Active widths tensor. Reads from the buffer in baseline mode; computes
+        masked-softmax of `_width_logits` in trainable mode. Padding slots are 0 in
+        either case."""
+        if self.trainable_widths:
+            pad = self._padding_mask(device=self._width_logits.device)
+            logits = self._width_logits.masked_fill(pad, self._WIDTH_LOGIT_PAD)
+            w = torch.softmax(logits, dim=1)
+            # Padding entries are ~0 from the sentinel; force exact 0 to keep
+            # downstream masking/cumsum behaviour identical to the buffer path.
+            return w.masked_fill(pad, 0.0)
+        return self._interval_widths_buf
+
+    @interval_widths.setter
+    def interval_widths(self, value: torch.Tensor):
+        """Assignment is supported only in baseline mode (mutates the buffer in place
+        of identity). In trainable mode, `_width_logits` must be edited via the
+        optimizer-surgery path; direct assignment would silently bypass Adam state."""
+        if self.trainable_widths:
+            raise RuntimeError(
+                "Cannot assign to Spline.interval_widths in trainable_widths mode; "
+                "update Spline._width_logits via optimizer surgery instead."
+            )
+        # Re-register so device tracking stays consistent.
+        self._interval_widths_buf = value
 
     def get_initial_points(self) -> torch.Tensor:
         """
@@ -154,11 +220,11 @@ class Spline(nn.Module):
         Expand a degenerate (collapsed-to-a-point) spline to a full multi-interval spline,
         seeded from the current static position joint_points[:, 0, :].
 
-        Used at the Phase-1 → Phase-2 boundary in two-phase training: Phase 1 trains a
+        Used at the Phase-0 → Phase-1 boundary in three-phase training: Phase 0 trains a
         single static position living in joint_points[:, 0, :]. This method broadcasts that
         position into every joint slot AND every control point (control points are absolute
         world positions, see _assemble_interval_points), so the spline still evaluates to
-        the same static point, but now has the full parameter capacity that Phase 2 will
+        the same static point, but now has the full parameter capacity that Phase 1 will
         learn trajectories into.
 
         After this returns, the parameters have been replaced (new tensor identities), so
@@ -188,7 +254,13 @@ class Spline(nn.Module):
         self.max_intervals = target_intervals
 
         widths = torch.full((C, target_intervals), 1.0 / target_intervals, dtype=torch.float32, device=device)
-        self.interval_widths = widths
+        if self.trainable_widths:
+            # Replace the Parameter identity (Adam state for the spline groups is reset
+            # by the caller's reset_spline_optim_state() — same path as joint_points etc).
+            self._width_logits = nn.Parameter(self._widths_to_logits(widths))
+            self._width_logits.register_hook(self._width_logits_grad_hook)
+        else:
+            self._interval_widths_buf = widths
 
         self.c1_mask = torch.zeros(C, target_intervals + 1, dtype=torch.bool, device=device)
         self.g1_mask = torch.zeros(C, target_intervals + 1, dtype=torch.bool, device=device)
@@ -634,17 +706,19 @@ class Spline(nn.Module):
             kwargs["g1_scale"] = torch.tensor(data["g1_scale"], dtype=torch.float32)
         return cls(**kwargs)
 
-    def get_optimizable_groups(self, base_lr : float) -> List[dict]:
+    def get_optimizable_groups(self, base_lr : float, width_lr_scale: float = 0.1) -> List[dict]:
         """
         Returns a list of dictionaries representing optimizable parameter groups for the spline.
 
         Parameters:
             base_lr (float): Base learning rate for the optimizer.
+            width_lr_scale (float): Multiplier applied to base_lr for the _width_logits group
+                when trainable_widths is enabled. Ignored otherwise.
 
         Returns:
             List[Dict]: A list of dictionaries, each containing 'params' and 'lr' keys.
         """
-        return [
+        groups = [
             { "params": [self.joint_points], "lr": base_lr, "name": f"{self.name}_joint_points" },
             { "params": [self.control_points], "lr": base_lr, "name": f"{self.name}_control_points" },
             # g1_scale is a per-junction tangent-magnitude scalar (one number, not a 3-vector).
@@ -652,6 +726,11 @@ class Spline(nn.Module):
             # the optimizer pushing magnitudes far off and producing degenerate tangents.
             { "params": [self.g1_scale], "lr": base_lr * 0.1, "name": f"{self.name}_g1_scale" },
         ]
+        if self.trainable_widths:
+            groups.append(
+                { "params": [self._width_logits], "lr": base_lr * width_lr_scale, "name": f"{self.name}_width_logits" }
+            )
+        return groups
 
 
     def update_params_(self, params: dict):
@@ -668,6 +747,14 @@ class Spline(nn.Module):
         g1_key = f"{self.name}_g1_scale"
         if g1_key in params:
             self.g1_scale = params[g1_key]
+        # _width_logits is optional and only meaningful in trainable_widths mode.
+        # When present, the caller has produced the post-surgery Parameter; rebind
+        # and re-attach the padding-grad hook (hooks don't survive identity changes).
+        wl_key = f"{self.name}_width_logits"
+        if wl_key in params:
+            assert self.trainable_widths, f"{wl_key} provided but trainable_widths=False"
+            self._width_logits = params[wl_key]
+            self._width_logits.register_hook(self._width_logits_grad_hook)
         self.num_curves = self.joint_points.shape[0]
 
     def prune_(self, mask: torch.Tensor):
@@ -688,7 +775,12 @@ class Spline(nn.Module):
         self.g1_mask = self.g1_mask[m]
         # g1_scale is now an nn.Parameter — the caller filters it through
         # _prune_optimizer() and writes it back via update_params_().
-        self.interval_widths = self.interval_widths[m]
+        if self.trainable_widths:
+            # _width_logits is an nn.Parameter — the caller filters it through
+            # _prune_optimizer() and writes it back via update_params_(), same as g1_scale.
+            pass
+        else:
+            self._interval_widths_buf = self._interval_widths_buf[m]
 
     def extend_(
         self,
@@ -752,7 +844,14 @@ class Spline(nn.Module):
         self.intervals_per_curve = torch.cat([self.intervals_per_curve, intervals_per_curve], dim=0)
         self.c1_mask = torch.cat([self.c1_mask, c1_mask], dim=0)
         self.g1_mask = torch.cat([self.g1_mask, g1_mask], dim=0)
-        self.interval_widths = torch.cat([self.interval_widths, interval_widths], dim=0)
+        if self.trainable_widths:
+            # _width_logits is an nn.Parameter — the caller appends new rows via
+            # cat_tensors_to_optimizer() and writes the updated parameter back
+            # through update_params_(). The interval_widths arg here is the seed
+            # used by create_new_curves() to construct the matching logits rows.
+            pass
+        else:
+            self._interval_widths_buf = torch.cat([self._interval_widths_buf, interval_widths], dim=0)
 
 
     def clone_and_modify(
@@ -798,6 +897,18 @@ class Spline(nn.Module):
         else:
             updated[f"{self.name}_g1_scale"] = self.g1_scale.clone()
 
+        # _width_logits: same selection convention as g1_scale; only emitted in trainable mode.
+        if self.trainable_widths:
+            if "width_logits" in fns:
+                updated[f"{self.name}_width_logits"] = fns["width_logits"](self._width_logits)
+            elif mask is not None:
+                sel = self._width_logits[mask]
+                if n_repeats > 1:
+                    sel = sel.repeat(n_repeats, 1)
+                updated[f"{self.name}_width_logits"] = sel
+            else:
+                updated[f"{self.name}_width_logits"] = self._width_logits.clone()
+
         return updated
 
     def create_new_curves(self, initial_points: torch.Tensor, num_intervals: Optional[int] = None) -> dict:
@@ -823,11 +934,26 @@ class Spline(nn.Module):
         # New curves default to g1_scale = 1.0 at every junction (C1-equivalent).
         new_g1_scale = torch.ones(N, num_joint, dtype=self.g1_scale.dtype, device=self.g1_scale.device)
 
-        return {
+        out = {
             f"{self.name}_joint_points": new_joint,
             f"{self.name}_control_points": new_ctrl,
             f"{self.name}_g1_scale": new_g1_scale,
         }
+        if self.trainable_widths:
+            # New curves default to uniform widths over their `intervals` valid slots,
+            # padded out to max_intervals. Build logits directly from those widths so
+            # the post-cat softmax matches a true uniform partition. Padding slots get
+            # the sentinel anchor.
+            device = self._width_logits.device
+            uniform_w = torch.zeros(N, self.max_intervals, dtype=self._width_logits.dtype, device=device)
+            uniform_w[:, :intervals] = 1.0 / max(intervals, 1)
+            # Build logits per-row using the same _padding_mask logic but on ad-hoc rows.
+            eps = 1e-12
+            logits = torch.log(uniform_w.clamp(min=eps))
+            pad_cols = torch.arange(self.max_intervals, device=device).unsqueeze(0) >= torch.full((N, 1), intervals, dtype=torch.long, device=device)
+            new_width_logits = torch.where(pad_cols, torch.full_like(logits, self._WIDTH_LOGIT_PAD), logits)
+            out[f"{self.name}_width_logits"] = new_width_logits
+        return out
 
 
     def split_intervals(self, split_mask: torch.Tensor, interval_indices: torch.Tensor, uniform_split: bool = False, local_t_per_curve: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1157,8 +1283,22 @@ class Spline(nn.Module):
                     if k + 1 < n:
                         new_w[c, k + 2:n + 1] = old_w[c, k + 1:n]
 
-        self.interval_widths = new_w
-        return new_jp, new_cp, new_intervals_per_curve, new_g1_scale
+        if self.trainable_widths:
+            # Convert post-split widths to logits. Padding slots (k >= new_intervals_per_curve[c])
+            # get the sentinel; valid slots get log(width). Detach from autograd because the
+            # values originated from a softmax over the pre-split logits, but the post-split
+            # _width_logits will be installed as a fresh nn.Parameter by the caller.
+            eps = 1e-12
+            new_w_d = new_w.detach()
+            log_w = torch.log(new_w_d.clamp(min=eps))
+            k_range = torch.arange(new_max, device=new_w.device)
+            new_pad = k_range.unsqueeze(0) >= new_intervals_per_curve.to(new_w.device).unsqueeze(1)
+            new_width_logits = torch.where(new_pad, torch.full_like(log_w, self._WIDTH_LOGIT_PAD), log_w)
+            # Do NOT assign to self.interval_widths — caller wires logits through optimizer surgery.
+            return new_jp, new_cp, new_intervals_per_curve, new_g1_scale, new_width_logits
+        else:
+            self._interval_widths_buf = new_w
+            return new_jp, new_cp, new_intervals_per_curve, new_g1_scale
 
     def compute_control_polygon_lengths(self) -> torch.Tensor:
         """
