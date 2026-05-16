@@ -7,7 +7,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, src_is_next_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -107,13 +107,26 @@ class Spline(nn.Module):
         # optimizer surgery as joint_points and control_points.
         self.g1_scale = nn.Parameter(g1_scale.clone().detach())
 
+        # Per-joint derivation direction. src_is_next_mask[c, k] selects which
+        # neighbor of joint k acts as the "source" in the continuity derivation:
+        #   False (default) → source = C_{k-1, last}; derived = C_{k, 0}      (forward)
+        #   True            → source = C_{k, 0};      derived = C_{k-1, last} (inverted)
+        # Only meaningful at internal joints with c1_mask or g1_mask set.
+        # Defaults to all-False so existing runs retain the original behavior.
+        if src_is_next_mask is None:
+            src_is_next_mask = torch.zeros(num_curves, self.max_intervals + 1, dtype=torch.bool)
+        if src_is_next_mask.shape != (num_curves, self.max_intervals + 1):
+            raise ValueError(f"src_is_next_mask must have shape ({num_curves}, {self.max_intervals + 1}), got {src_is_next_mask.shape}")
+        self.register_buffer('src_is_next_mask', src_is_next_mask)
+
         # Interval widths: fraction of [0, 1] owned by each interval.
         # Defaults to uniform (1/n for each valid slot, 0 for padding).
         if interval_widths is None:
             interval_widths = torch.zeros(num_curves, self.max_intervals, dtype=torch.float32)
             for c in range(num_curves):
                 n = int(self.intervals_per_curve[c].item())
-                interval_widths[c, :n] = 1.0 / n
+                if n > 0:
+                    interval_widths[c, :n] = 1.0 / n
         if interval_widths.shape != (num_curves, self.max_intervals):
             raise ValueError(f"interval_widths must have shape ({num_curves}, {self.max_intervals}), got {interval_widths.shape}")
         # Storage routes through one of two slots, exposed via the `interval_widths` property:
@@ -127,6 +140,14 @@ class Spline(nn.Module):
             self._width_logits.register_hook(self._width_logits_grad_hook)
         else:
             self.register_buffer('_interval_widths_buf', interval_widths)
+
+        # Defensive grad-cache buffers for the new learnable params (matches the
+        # joint/control pattern above). The live training loop reallocates these
+        # via zero_gradient_cache() at every iter; this exists so cache_gradient()
+        # doesn't AttributeError if called before the first zero.
+        self._g1_scale_grd = torch.zeros_like(self.g1_scale, requires_grad=False)
+        if self.trainable_widths:
+            self._width_logits_grd = torch.zeros_like(self._width_logits, requires_grad=False)
 
     # Backward-compatible property
     @property
@@ -186,6 +207,23 @@ class Spline(nn.Module):
         # Re-register so device tracking stays consistent.
         self._interval_widths_buf = value
 
+    def joint_t_values(self) -> torch.Tensor:
+        """
+        Cumulative t-values for every joint, including padding.
+
+        Joint k of curve c is at t = sum(interval_widths[c, 0:k]). Joint 0 is at t=0;
+        the last valid joint (k = intervals_per_curve[c]) is at t=1.0; padding joints
+        beyond it remain at 1.0 (interval_widths is zero in padding slots).
+
+        Returns:
+            torch.Tensor: Shape (num_curves, max_intervals + 1). Same device/dtype as
+            interval_widths.
+        """
+        widths = self.interval_widths                                       # (C, K)
+        cumsum = torch.cumsum(widths, dim=1)                                # (C, K)
+        zero = torch.zeros(self.num_curves, 1, dtype=cumsum.dtype, device=cumsum.device)
+        return torch.cat([zero, cumsum], dim=1)                             # (C, K+1)
+
     def get_initial_points(self) -> torch.Tensor:
         """
         Returns the initial joint points of the spline, which are the positions at t=0.
@@ -215,17 +253,19 @@ class Spline(nn.Module):
         self.joint_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals + 1, 1))
         self.control_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals * self.__ctrl_pts_per_interval, 1))
 
-    def expand_to_full_spline(self, target_intervals: int):
+    def expand_to_full_spline(self, target_intervals: int, static_pos: Optional[torch.Tensor] = None):
         """
         Expand a degenerate (collapsed-to-a-point) spline to a full multi-interval spline,
-        seeded from the current static position joint_points[:, 0, :].
+        seeded from `static_pos` (the position the Phase-0 spline actually rendered at).
 
         Used at the Phase-0 → Phase-1 boundary in three-phase training: Phase 0 trains a
-        single static position living in joint_points[:, 0, :]. This method broadcasts that
-        position into every joint slot AND every control point (control points are absolute
-        world positions, see _assemble_interval_points), so the spline still evaluates to
-        the same static point, but now has the full parameter capacity that Phase 1 will
-        learn trajectories into.
+        spline that's evaluated only at one anchor t. The actual rendered position is
+        forward(t_anchor), NOT joint_points[:, 0, :] — those can drift along the gradient-
+        nullspace of B(t_anchor). The caller passes the evaluated anchor position so the
+        new spline is broadcast to that point, and Phase 1 starts at the same on-screen
+        location instead of teleporting to J0.
+
+        Falls back to joint_points[:, 0, :] if static_pos is None (legacy callers).
 
         After this returns, the parameters have been replaced (new tensor identities), so
         any optimizer holding references to the old tensors must rebind its param groups
@@ -239,7 +279,12 @@ class Spline(nn.Module):
         dim = self.num_dim
         k_per = self.__ctrl_pts_per_interval
 
-        static_pos = self.joint_points.detach()[:, 0, :]  # (C, dim)
+        if static_pos is None:
+            static_pos = self.joint_points.detach()[:, 0, :]  # (C, dim)
+        else:
+            if static_pos.shape != (C, dim):
+                raise ValueError(f"static_pos must have shape ({C}, {dim}), got {static_pos.shape}")
+            static_pos = static_pos.to(device=device, dtype=self.joint_points.dtype).detach()
 
         new_joints = static_pos.unsqueeze(1).repeat(1, target_intervals + 1, 1).contiguous()
         new_controls = static_pos.unsqueeze(1).repeat(1, target_intervals * k_per, 1).contiguous()
@@ -265,14 +310,19 @@ class Spline(nn.Module):
         self.c1_mask = torch.zeros(C, target_intervals + 1, dtype=torch.bool, device=device)
         self.g1_mask = torch.zeros(C, target_intervals + 1, dtype=torch.bool, device=device)
         self.g1_scale = nn.Parameter(torch.ones(C, target_intervals + 1, dtype=torch.float32, device=device))
+        self.src_is_next_mask = torch.zeros(C, target_intervals + 1, dtype=torch.bool, device=device)
+
+        self._g1_scale_grd = torch.zeros_like(self.g1_scale, requires_grad=False)
+        if self.trainable_widths:
+            self._width_logits_grd = torch.zeros_like(self._width_logits, requires_grad=False)
 
     def set_c1(self, curve_idx: int, joint_idx: int, enabled: bool = True):
         """
         Mark a joint as smooth (C1) or release it.
 
-        A control point C_{k,0} is derived only when BOTH joint k and joint k+1 are
-        marked smooth. Marking a single joint does not derive any control point until
-        its neighbour is also marked.
+        At an active internal joint k, one of the two adjacent control points is
+        derived from the other via reflection through J_k. The direction is
+        controlled by src_is_next_mask[c, k] (see set_src_is_next).
 
         Parameters:
             curve_idx (int): Index of the curve.
@@ -292,10 +342,11 @@ class Spline(nn.Module):
         Mark a joint as G1 (geometric continuity, direction-only) with a given tangent
         magnitude ratio. Mutually exclusive with C1.
 
-        At G1 junctions, the first control point of the next interval is derived as
-            C_{k,0} = J_k + scale * (J_k - C_{k-1, last})
-        so the incoming and outgoing tangents are anti-parallel through J_k but their
-        magnitudes can differ by `scale` (scale=1.0 ↔ C1 reflection).
+        At an active internal joint k, one of the two adjacent control points is
+        derived as a scaled reflection through J_k:
+            derived = (1 + scale) * J_k - scale * source
+        The direction (which side is derived vs. source) is controlled by
+        src_is_next_mask[c, k] (see set_src_is_next).
 
         Parameters:
             curve_idx (int): Index of the curve.
@@ -310,22 +361,47 @@ class Spline(nn.Module):
         # g1_scale is a leaf Parameter — slice-assignment via .data avoids the
         # autograd "view of a leaf" error.
         self.g1_scale.data[curve_idx, joint_idx] = float(scale)
-        if enabled:
-            self.c1_mask[curve_idx, joint_idx] = False
+
+    def set_src_is_next(self, curve_idx: int, joint_idx: int, src_is_next: bool = True):
+        """
+        Set the derivation direction at an internal joint.
+
+        Only meaningful when c1_mask[c, k] or g1_mask[c, k] is True at the same joint;
+        otherwise the flag is inert. Has no effect at the endpoint joints (k=0 or
+        k=intervals_per_curve[c]) since neither has a "left" and "right" neighbor.
+
+            src_is_next = False (default): derived = C_{k, 0}, source = C_{k-1, last}
+            src_is_next = True  (inverted): derived = C_{k-1, last}, source = C_{k, 0}
+
+        Parameters:
+            curve_idx (int): Index of the curve.
+            joint_idx (int): Index of the joint (must be internal: 1..intervals_per_curve[c]-1).
+            src_is_next (bool): Direction flag.
+        """
+        n = int(self.intervals_per_curve[curve_idx].item())
+        if not (1 <= joint_idx <= n - 1):
+            raise ValueError(f"joint_idx must be internal (1..{n - 1}), got {joint_idx}")
+        self.src_is_next_mask[curve_idx, joint_idx] = bool(src_is_next)
 
     def get_effective_control_points(self) -> torch.Tensor:
         """
-        Returns control points with C1 continuity constraints applied.
+        Returns control points with C1/G1 continuity constraints applied.
 
-        At each junction k where c1_mask[c, k] is True, the first control point of
-        interval k is derived as the reflection of the previous interval's last control
-        point through the joint:
-            C_{k,0} = 2 * J_k - C_{k-1, last}
+        At each internal joint k where c1_mask[c, k] or g1_mask[c, k] is True,
+        one of the two control points adjacent to the joint is *derived* from
+        the other (the *source*), scaled by g1_scale[c, k] = λ_k. C1 is the
+        special case λ_k = 1.
 
-        The remaining control points of the interval are unchanged (free).
+        Direction is selected per-joint by src_is_next_mask[c, k]:
+            False (default): source = C_{k-1, last};  derived = C_{k, 0}
+                C_{k, 0}      = (1 + λ_k) * J_k - λ_k * C_{k-1, last}
+            True (inverted): source = C_{k, 0};       derived = C_{k-1, last}
+                C_{k-1, last} = (1 + λ_k) * J_k - λ_k * C_{k, 0}
+
+        Slots not touched by derivation pass through raw_cp unchanged.
 
         Returns:
-            torch.Tensor: Shape (num_curves, max_intervals, degree-1, num_dim).
+            torch.Tensor: Shape (num_curves, max_intervals, k_per, num_dim).
         """
         k_per = self.__ctrl_pts_per_interval
         C = self.num_curves
@@ -340,66 +416,69 @@ class Spline(nn.Module):
         if not (any_c1 or any_g1):
             return raw_cp
 
-        # Vectorized derive mask: a junction k contributes a derived first CP for
-        # interval k when both joint k and joint k+1 carry the same continuity flag
-        # (C1 or G1) and interval k is a real, internal interval.
-        # Conditions per side: k >= 1, k < intervals_per_curve[c], mask[c,k], mask[c,k+1]
-        k_range = torch.arange(K, device=device)          # (K,)
-        ipc = self.intervals_per_curve.to(device)          # (C,)
-        interval_valid = k_range.unsqueeze(0) < ipc.unsqueeze(1)   # (C, K)
-        internal       = k_range.unsqueeze(0) >= 1                  # (1, K) → broadcasts
+        # Derivation is a joint-level property at internal joints k = 1..K-1.
+        if K < 2:
+            return raw_cp  # No internal joints possible
 
-        c1 = self.c1_mask.to(device)              # (C, K+1)
-        c1_left  = c1[:, :K]                       # (C, K) — c1_mask[c, k]
-        c1_right = c1[:, 1:]                       # (C, K) — c1_mask[c, k+1]
-        c1_derive = internal & interval_valid & c1_left & c1_right  # (C, K)
+        k_int = torch.arange(1, K, device=device)                       # interval indices 1..K-1
+        ipc = self.intervals_per_curve.to(device)
+        interval_valid = k_int.unsqueeze(0) < ipc.unsqueeze(1)          # (C, K-1)
 
-        g1 = self.g1_mask.to(device)              # (C, K+1)
-        g1_left  = g1[:, :K]
-        g1_right = g1[:, 1:]
-        g1_derive = internal & interval_valid & g1_left & g1_right  # (C, K)
+        c1_at_joint = self.c1_mask.to(device)[:, 1:K]                   # (C, K-1) — c1_mask[c, k]
+        g1_at_joint = self.g1_mask.to(device)[:, 1:K]                   # (C, K-1) — g1_mask[c, k]
+        active = (c1_at_joint | g1_at_joint) & interval_valid           # (C, K-1)
 
-        derive_mask = c1_derive | g1_derive
-
-        if not derive_mask.any():
+        if not active.any():
             return raw_cp
 
-        # J_k = joint_points[:, k, :]  →  joint_points[:, :K, :]  (C, K, dim)
-        J = self.joint_points[:, :K, :]  # (C, K, dim)
+        # k_per == 1 (quadratic) collapses slot 0 and slot last to the same storage,
+        # so forward and inverted writes would race for the same cell. Reject mixed
+        # configurations and fall back to forward-only otherwise.
+        if k_per == 1 and self.src_is_next_mask.any():
+            raise NotImplementedError(
+                "src_is_next_mask is unsupported for k_per == 1 (degree-2 curves): "
+                "slot 0 and slot last alias the same storage."
+            )
 
-        # C_{k-1, last}: raw_cp[:, k-1, k_per-1, :] for k=1..K-1; dummy zeros for k=0
-        prev_last = torch.cat([
-            torch.zeros(C, 1, self.num_dim, device=device),  # dummy for k=0 (never used)
-            raw_cp[:, :-1, k_per - 1, :],                    # k=1..K-1
-        ], dim=1)  # (C, K, dim)
+        # ── Source selection ──────────────────────────────────────────────────
+        # src_is_next[c, k] = True → source = next interval's slot 0
+        # src_is_next[c, k] = False → source = prev interval's slot last
+        src_is_next = self.src_is_next_mask.to(device)[:, 1:K].unsqueeze(-1)   # (C, K-1, 1)
+        prev_last   = raw_cp[:, :K - 1, k_per - 1, :]                          # (C, K-1, dim)
+        next_first  = raw_cp[:, 1:, 0, :]                                      # (C, K-1, dim)
+        source      = torch.where(src_is_next, next_first, prev_last)          # (C, K-1, dim)
 
-        # C1 derive: C_{k,0} = 2*J - prev_last
-        # G1 derive: C_{k,0} = J + λ * (J - prev_last) = (1+λ)*J - λ*prev_last
-        # where λ = g1_scale[:, :K].
-        # When derive_mask[c,k] is False, we keep the raw value.
-        # When both c1_derive[c,k] and g1_derive[c,k] are True (forbidden by the mutex
-        # invariant in __init__/set_c1/set_g1), C1 wins via the where ordering below.
-        lam = self.g1_scale[:, :K].to(device).unsqueeze(-1)  # (C, K, 1)
-        g1_first = (1.0 + lam) * J - lam * prev_last         # (C, K, dim)
-        c1_first = 2.0 * J - prev_last                        # (C, K, dim)
+        # ── One derivation, unified ────────────────────────────────────────────
+        # C1 ⊂ G1 with λ = 1; mask precedence handled by c1_mask & g1_mask mutex.
+        J_int       = self.joint_points[:, 1:K, :]                             # (C, K-1, dim)
+        g1_lam      = self.g1_scale[:, 1:K].to(device).unsqueeze(-1)           # (C, K-1, 1)
+        ones        = torch.ones_like(g1_lam)
+        effective_λ = torch.where(c1_at_joint.unsqueeze(-1), ones, g1_lam)     # (C, K-1, 1)
+        derived     = (1.0 + effective_λ) * J_int - effective_λ * source       # (C, K-1, dim)
 
-        # Pick C1 result where c1_derive, G1 result where only g1_derive, else raw.
-        derived_first = torch.where(
-            c1_derive.unsqueeze(-1),
-            c1_first,
-            torch.where(g1_derive.unsqueeze(-1), g1_first, raw_cp[:, :, 0, :]),
-        )  # (C, K, dim)
+        # ── Routing: derived is written to the side OPPOSITE the source ────────
+        active_u      = active.unsqueeze(-1)
+        write_to_next = active_u & ~src_is_next   # writes interval k's slot 0
+        write_to_prev = active_u &  src_is_next   # writes interval k-1's slot last
 
-        new_first = torch.where(
-            derive_mask.unsqueeze(-1),
-            derived_first,
-            raw_cp[:, :, 0, :],
-        )  # (C, K, dim)
+        # Slot-0 column: derived at intervals 1..K-1 where write_to_next; raw elsewhere.
+        # Reattach interval 0's slot 0 (never derived).
+        raw_first_int = raw_cp[:, 1:, 0, :]
+        new_first_int = torch.where(write_to_next, derived, raw_first_int)
+        new_first     = torch.cat([raw_cp[:, :1, 0, :], new_first_int], dim=1)  # (C, K, dim)
 
         if k_per == 1:
             return new_first.unsqueeze(2)  # (C, K, 1, dim)
 
-        return torch.cat([new_first.unsqueeze(2), raw_cp[:, :, 1:, :]], dim=2)  # (C, K, k_per, dim)
+        # Slot-last column: derived at intervals 0..K-2 where write_to_prev; raw elsewhere.
+        # Reattach interval K-1's slot last (never derived).
+        raw_last_int = raw_cp[:, :K - 1, k_per - 1, :]
+        new_last_int = torch.where(write_to_prev, derived, raw_last_int)
+        new_last     = torch.cat([new_last_int, raw_cp[:, K - 1:K, k_per - 1, :]], dim=1)  # (C, K, dim)
+
+        # Three-part reassembly. For k_per == 2 (cubic) `middle` is empty.
+        middle = raw_cp[:, :, 1:k_per - 1, :]
+        return torch.cat([new_first.unsqueeze(2), middle, new_last.unsqueeze(2)], dim=2)
 
     def _assemble_interval_points(self) -> torch.Tensor:
         """
@@ -484,6 +563,17 @@ class Spline(nn.Module):
 
         N = t.shape[0]
         device = t.device
+
+        # K=0 short-circuit: static-point spline. forward(t) is the single
+        # joint regardless of t. map_to_local can't run on (C, 0) widths
+        # (clamp(max=-1) yields invalid gather indices), so bypass the whole
+        # interval pipeline. .expand returns a view on the leaf Parameter so
+        # autograd accumulates into joint_points; .contiguous() materializes
+        # for downstream ops that don't tolerate zero-stride views.
+        if self.max_intervals == 0:
+            return self.joint_points[:, 0, :].unsqueeze(1).expand(
+                self.num_curves, N, self.num_dim
+            ).contiguous()
 
         # Step 1: Per-curve interval mapping (non-uniform widths)
         interval_idx, local_t, _widths = self.map_to_local(t)
@@ -589,18 +679,38 @@ class Spline(nn.Module):
     def zero_gradient_cache(self):
         self._control_points_grd = torch.zeros_like(self.control_points, requires_grad=False)
         self._joint_points_grd = torch.zeros_like(self.joint_points, requires_grad=False)
+        self._g1_scale_grd = torch.zeros_like(self.g1_scale, requires_grad=False)
+        if self.trainable_widths:
+            self._width_logits_grd = torch.zeros_like(self._width_logits, requires_grad=False)
 
     def cache_gradient(self):
-        if self.control_points.grad is None or self.joint_points.grad is None:
+        if self.joint_points.grad is None:
             raise ValueError("Gradient cache has not been initialized. Call zero_gradient_cache() first.")
-
-        self._control_points_grd += self.control_points.grad.clone()
         self._joint_points_grd += self.joint_points.grad.clone()
+        # K=0 splines have an empty control_points Parameter (shape (C, 0, dim))
+        # that the forward short-circuit never touches, so autograd leaves
+        # control_points.grad as None. The cached buffer is also empty, so
+        # there's nothing to accumulate — skip silently in that case.
+        if self.control_points.grad is not None:
+            self._control_points_grd += self.control_points.grad.clone()
+        # g1_scale / _width_logits: grad is None when no derivation is active
+        # (e.g. K=0 Phase-0 splines, or g1_mask all False). Skip silently.
+        if self.g1_scale.grad is not None:
+            self._g1_scale_grd += self.g1_scale.grad.clone()
+        if self.trainable_widths and self._width_logits.grad is not None:
+            self._width_logits_grd += self._width_logits.grad.clone()
 
     def set_batch_gradient(self, cnt):
         ratio = 1 / cnt
-        self.control_points.grad = self._control_points_grd * ratio
         self.joint_points.grad = self._joint_points_grd * ratio
+        # See cache_gradient: K=0 control_points has no gradient. Writing the
+        # empty zero buffer back is harmless but the optimizer doesn't need it
+        # either — skip if the cached buffer is empty.
+        if self._control_points_grd.numel() > 0:
+            self.control_points.grad = self._control_points_grd * ratio
+        self.g1_scale.grad = self._g1_scale_grd * ratio
+        if self.trainable_widths:
+            self._width_logits.grad = self._width_logits_grd * ratio
 
 
     def to_numpy_dict(self) -> Dict[str, np.ndarray]:
@@ -651,6 +761,12 @@ class Spline(nn.Module):
         for k in range(g1s.shape[1]):
             result[f"{self.name}_g1_scale_{k}"] = g1s[:, k]
 
+        # Export src_is_next_mask (derivation direction). Older PLYs without this
+        # field load with defaults (all False = forward direction).
+        sin = self.src_is_next_mask.cpu().numpy().astype(np.uint8)
+        for k in range(sin.shape[1]):
+            result[f"{self.name}_src_is_next_joint_{k}"] = sin[:, k]
+
         # Export interval_widths
         iw = self.interval_widths.cpu().numpy()  # (N, max_intervals)
         for k in range(iw.shape[1]):
@@ -673,6 +789,7 @@ class Spline(nn.Module):
             "c1_mask": self.c1_mask.cpu().tolist(),
             "g1_mask": self.g1_mask.cpu().tolist(),
             "g1_scale": self.g1_scale.cpu().tolist(),
+            "src_is_next_mask": self.src_is_next_mask.cpu().tolist(),
             "interval_widths": self.interval_widths.cpu().tolist(),
         }
         with open(path, "w") as f:
@@ -704,6 +821,8 @@ class Spline(nn.Module):
             kwargs["g1_mask"] = torch.tensor(data["g1_mask"], dtype=torch.bool)
         if "g1_scale" in data:
             kwargs["g1_scale"] = torch.tensor(data["g1_scale"], dtype=torch.float32)
+        if "src_is_next_mask" in data:
+            kwargs["src_is_next_mask"] = torch.tensor(data["src_is_next_mask"], dtype=torch.bool)
         return cls(**kwargs)
 
     def get_optimizable_groups(self, base_lr : float, width_lr_scale: float = 0.1) -> List[dict]:
@@ -773,6 +892,7 @@ class Spline(nn.Module):
         self.intervals_per_curve = self.intervals_per_curve[m]
         self.c1_mask = self.c1_mask[m]
         self.g1_mask = self.g1_mask[m]
+        self.src_is_next_mask = self.src_is_next_mask[m]
         # g1_scale is now an nn.Parameter — the caller filters it through
         # _prune_optimizer() and writes it back via update_params_().
         if self.trainable_widths:
@@ -789,6 +909,7 @@ class Spline(nn.Module):
         c1_mask: Optional[torch.Tensor] = None,
         g1_mask: Optional[torch.Tensor] = None,
         g1_scale: Optional[torch.Tensor] = None,
+        src_is_next_mask: Optional[torch.Tensor] = None,
         interval_widths: Optional[torch.Tensor] = None,
     ):
         """
@@ -822,6 +943,12 @@ class Spline(nn.Module):
             g1_mask = torch.zeros(num_added, self.max_intervals + 1, dtype=torch.bool)
         g1_mask = g1_mask.to(self.g1_mask.device)
 
+        if src_is_next_mask is None:
+            src_is_next_mask = torch.zeros(num_added, self.max_intervals + 1, dtype=torch.bool)
+        if src_is_next_mask.shape != (num_added, self.max_intervals + 1):
+            raise ValueError(f"src_is_next_mask must have shape ({num_added}, {self.max_intervals + 1}), got {src_is_next_mask.shape}")
+        src_is_next_mask = src_is_next_mask.to(self.src_is_next_mask.device)
+
         # g1_scale is now an nn.Parameter — the caller appends new rows via
         # cat_tensors_to_optimizer() and writes the updated parameter back
         # through update_params_(). The g1_scale arg here is accepted for
@@ -834,23 +961,31 @@ class Spline(nn.Module):
         if (c1_mask & g1_mask).any():
             raise ValueError("c1_mask and g1_mask are mutually exclusive: a junction cannot be both")
 
-        if interval_widths is None:
-            interval_widths = torch.zeros(num_added, self.max_intervals, dtype=self.interval_widths.dtype)
-            for i in range(num_added):
-                n = int(intervals_per_curve[i].item())
-                interval_widths[i, :n] = 1.0 / n
-        interval_widths = interval_widths.to(self.interval_widths.device)
-
         self.intervals_per_curve = torch.cat([self.intervals_per_curve, intervals_per_curve], dim=0)
         self.c1_mask = torch.cat([self.c1_mask, c1_mask], dim=0)
         self.g1_mask = torch.cat([self.g1_mask, g1_mask], dim=0)
+        self.src_is_next_mask = torch.cat([self.src_is_next_mask, src_is_next_mask], dim=0)
         if self.trainable_widths:
-            # _width_logits is an nn.Parameter — the caller appends new rows via
-            # cat_tensors_to_optimizer() and writes the updated parameter back
-            # through update_params_(). The interval_widths arg here is the seed
-            # used by create_new_curves() to construct the matching logits rows.
+            # _width_logits rows for the new curves were already installed by the
+            # caller via cat_tensors_to_optimizer + update_params_ before extend_
+            # ran. The interval_widths arg is dead in this path — do NOT read the
+            # interval_widths property here: it depends on intervals_per_curve
+            # (the cat above) and _width_logits (already extended upstream), and
+            # accessing it during the partial-update window misshapes the pad.
             pass
         else:
+            if interval_widths is None:
+                interval_widths = torch.zeros(
+                    num_added, self.max_intervals,
+                    dtype=self._interval_widths_buf.dtype,
+                    device=self._interval_widths_buf.device,
+                )
+                for i in range(num_added):
+                    n = int(intervals_per_curve[i].item())
+                    if n > 0:
+                        interval_widths[i, :n] = 1.0 / n
+            else:
+                interval_widths = interval_widths.to(self._interval_widths_buf.device)
             self._interval_widths_buf = torch.cat([self._interval_widths_buf, interval_widths], dim=0)
 
 
@@ -988,12 +1123,17 @@ class Spline(nn.Module):
                 - new_intervals_per_curve: (C,) long tensor
                 - new_g1_scale:            (C, new_max_intervals + 1) float tensor
 
-            Side effect: self.c1_mask and self.g1_mask are updated in-place to reflect
-            the inserted junction. The new junction inherits the same continuity flag
-            (C1 or G1) as its neighbours iff both neighbours carry it.
+            Side effect: self.c1_mask, self.g1_mask, and self.src_is_next_mask are
+            updated in-place to reflect the inserted junction. The new junction
+            inherits the same continuity flag (C1 or G1) as its neighbours iff both
+            neighbours carry it; the new junction's src_is_next defaults to False
+            (forward direction).
             self.g1_scale is NOT mutated here — it's an nn.Parameter, and the new
             tensor is returned so the caller can update the optimizer state in lockstep.
         """
+        if (split_mask & (self.intervals_per_curve.to(split_mask.device) == 0)).any():
+            raise ValueError("split_intervals: cannot split a K=0 (static point) curve")
+
         C = self.num_curves
         dim = self.num_dim
         degree = self.curve.degree
@@ -1253,6 +1393,21 @@ class Spline(nn.Module):
 
         self.g1_mask = new_g1_mask
         # Note: self.g1_scale is NOT mutated here — see the docstring.
+
+        # Shift src_is_next_mask in lockstep with g1_mask. New internal joint
+        # (k+1) defaults to False (forward direction); old joints k+1..n shift
+        # right by one to k+2..n+1.
+        new_src_is_next = torch.zeros(C, new_max + 1, dtype=torch.bool, device=self.src_is_next_mask.device)
+        for c in range(C):
+            n = int(self.intervals_per_curve[c].item())
+            if not split_mask[c]:
+                new_src_is_next[c, :n + 1] = self.src_is_next_mask[c, :n + 1]
+            else:
+                k = int(interval_indices[c].item())
+                new_src_is_next[c, :k + 1]      = self.src_is_next_mask[c, :k + 1]
+                # new_src_is_next[c, k + 1] already False (default forward).
+                new_src_is_next[c, k + 2:n + 2] = self.src_is_next_mask[c, k + 1:n + 1]
+        self.src_is_next_mask = new_src_is_next
 
         # Build shifted interval_widths.
         #   uniform_split=False: split interval k into two pieces sized by local_t,
