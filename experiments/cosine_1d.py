@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amplitude", type=float, default=1.0)
     p.add_argument("--intervals", type=int, default=8)
     p.add_argument("--trainable-widths", action="store_true")
+    p.add_argument("--relative-cp", action="store_true",
+                   help="Store control points as offsets from anchor joints instead of absolute positions.")
     p.add_argument("--iters", type=int, default=2000)
     p.add_argument("--lr", type=float, default=5e-2)
     p.add_argument("--width-lr-scale", type=float, default=0.1)
@@ -48,6 +50,7 @@ def build_spline(args: argparse.Namespace) -> Spline:
         num_curves=1,
         curve=Bezier(degree=3),
         trainable_widths=args.trainable_widths,
+        relative_control_points=args.relative_cp,
     )
     with torch.no_grad():
         spline.joint_points.add_(torch.randn_like(spline.joint_points) * 0.05)

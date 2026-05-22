@@ -7,7 +7,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, src_is_next_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, src_is_next_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, relative_control_points: bool = False, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -19,6 +19,15 @@ class Spline(nn.Module):
             num_curves (int): Number of curves (points that are moving across time). default is 1.
             joint_points (torch.Tensor): Tensor of joint points, shape (num_curves, max_intervals + 1, num_dim).
             control_points (torch.Tensor): Tensor of control points, shape (num_curves, max_intervals * (degree - 1), num_dim).
+                Interpretation depends on `relative_control_points`: when False (default), values are
+                absolute world-space positions; when True, values are offsets from a per-slot anchor
+                joint (slot i in interval k anchors to joint k if 2*i < k_per, else to joint k+1).
+            relative_control_points (bool): If True, the `control_points` parameter stores per-slot
+                offsets from anchor joints instead of absolute positions. Effective absolute positions
+                are reconstructed at the boundary of get_effective_control_points(); the rest of the
+                pipeline is unchanged. Changes optimization geometry: gradients to joint_points
+                absorb the CP gradients (joints become "translation handles"), and CP gradients
+                become pure tangent-shape gradients. Defaults to False (existing behavior).
             c1_mask (torch.Tensor, optional): Boolean tensor of shape (num_curves, max_intervals + 1).
                 c1_mask[c, k] = True enforces C1 continuity at junction k of curve c, deriving
                 its first control point as the reflection through the joint. Only internal junctions
@@ -37,6 +46,7 @@ class Spline(nn.Module):
         self.__ctrl_pts_per_interval = self.curve.degree - 1
         self.name = name
         self.trainable_widths = bool(trainable_widths)
+        self.relative_control_points = bool(relative_control_points)
         # Sentinel value for padding slots in _width_logits. exp(-1e9) ~ 0, so masked
         # softmax over a row puts ~0 mass on padding regardless of its other entries.
         self._WIDTH_LOGIT_PAD = -1e9
@@ -251,7 +261,15 @@ class Spline(nn.Module):
         self.num_curves = num_curves
 
         self.joint_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals + 1, 1))
-        self.control_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals * self.__ctrl_pts_per_interval, 1))
+        # In relative mode, offsets of 0 place each CP on its anchor joint —
+        # the same degenerate-static spline as broadcasting `pcd` in absolute mode.
+        if self.relative_control_points:
+            self.control_points = nn.Parameter(torch.zeros(
+                num_curves, self.max_intervals * self.__ctrl_pts_per_interval, self.num_dim,
+                dtype=pcd.dtype, device=pcd.device,
+            ))
+        else:
+            self.control_points = nn.Parameter(pcd.clone().detach().unsqueeze(1).repeat(1, self.max_intervals * self.__ctrl_pts_per_interval, 1))
 
     def expand_to_full_spline(self, target_intervals: int, static_pos: Optional[torch.Tensor] = None):
         """
@@ -287,7 +305,13 @@ class Spline(nn.Module):
             static_pos = static_pos.to(device=device, dtype=self.joint_points.dtype).detach()
 
         new_joints = static_pos.unsqueeze(1).repeat(1, target_intervals + 1, 1).contiguous()
-        new_controls = static_pos.unsqueeze(1).repeat(1, target_intervals * k_per, 1).contiguous()
+        if self.relative_control_points:
+            new_controls = torch.zeros(
+                C, target_intervals * k_per, dim,
+                dtype=static_pos.dtype, device=device,
+            )
+        else:
+            new_controls = static_pos.unsqueeze(1).repeat(1, target_intervals * k_per, 1).contiguous()
 
         self.joint_points = nn.Parameter(new_joints)
         self.control_points = nn.Parameter(new_controls)
@@ -383,6 +407,52 @@ class Spline(nn.Module):
             raise ValueError(f"joint_idx must be internal (1..{n - 1}), got {joint_idx}")
         self.src_is_next_mask[curve_idx, joint_idx] = bool(src_is_next)
 
+    def _anchor_joints_per_slot(self, joint_points: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Per-slot anchor joint tensor used by the relative-CP parametrization.
+
+        Slot i in interval k anchors to joint k (start) if 2*i < k_per, else joint k+1
+        (end). This makes slot 0 anchor to the start joint and slot (k_per-1) anchor
+        to the end joint — the invariant the C1/G1 derivation depends on (source and
+        derived both sit on the same junction joint, so the offset simplification is
+        clean for k_per >= 2).
+
+        Parameters:
+            joint_points (torch.Tensor, optional): Shape (C, K+1, dim). Defaults to
+                self.joint_points. Pass an alternative tensor to anchor against a
+                different joint layout (used by split_intervals during its rebuild).
+
+        Returns:
+            torch.Tensor: Shape (C, K, k_per, dim), same dtype/device as joint_points.
+        """
+        if joint_points is None:
+            joint_points = self.joint_points
+        k_per = self.__ctrl_pts_per_interval
+        device = joint_points.device
+        slot_idx = torch.arange(k_per, device=device)
+        use_end = (2 * slot_idx >= k_per).view(1, 1, k_per, 1)
+        start_J = joint_points[:, :-1, :].unsqueeze(2)
+        end_J   = joint_points[:, 1:, :].unsqueeze(2)
+        return torch.where(use_end, end_J, start_J)
+
+    def _cp_to_absolute(self, raw_cp: torch.Tensor, joint_points: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Convert a stored-form CP tensor to absolute world-space positions. Identity
+        in absolute mode; adds the per-slot anchor joint in relative mode.
+
+        Shapes: raw_cp is (C, K, k_per, dim); joint_points defaults to self.joint_points.
+        """
+        if not self.relative_control_points:
+            return raw_cp
+        return raw_cp + self._anchor_joints_per_slot(joint_points)
+
+    def _cp_to_offsets(self, abs_cp: torch.Tensor, joint_points: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Inverse of _cp_to_absolute: convert absolute CP positions back to per-slot
+        offsets. Identity in absolute mode. Used when writing externally-computed
+        absolute positions (e.g. De Casteljau output) back into stored control_points.
+        """
+        if not self.relative_control_points:
+            return abs_cp
+        return abs_cp - self._anchor_joints_per_slot(joint_points)
+
     def get_effective_control_points(self) -> torch.Tensor:
         """
         Returns control points with C1/G1 continuity constraints applied.
@@ -408,8 +478,13 @@ class Spline(nn.Module):
         K = self.max_intervals
         device = self.control_points.device
 
-        # (C, K, k_per, dim)
-        raw_cp = self.control_points.view(C, K, k_per, self.num_dim)
+        # (C, K, k_per, dim) — convert from stored form to absolute positions.
+        # In absolute mode this is a view of the leaf Parameter; in relative mode
+        # it's `offsets + anchor_joint`, so autograd routes CP gradients into both
+        # `control_points` (offset) and `joint_points` (the anchor). That's the
+        # whole point of the reparametrization: moving a joint drags its attached
+        # CPs along automatically.
+        raw_cp = self._cp_to_absolute(self.control_points.view(C, K, k_per, self.num_dim))
 
         any_c1 = self.c1_mask.any()
         any_g1 = self.g1_mask.any()
@@ -778,14 +853,18 @@ class Spline(nn.Module):
     def save(self, path: str) -> None:
         """Serialize the spline to a human-readable JSON file."""
         data = {
-            "version": 2,
+            "version": 3,
             "num_dim": self.num_dim,
             "degree": self.curve.degree,
             "name": self.name,
             "num_curves": self.num_curves,
             "intervals_per_curve": self.intervals_per_curve.tolist(),
             "joint_points": self.joint_points.detach().cpu().tolist(),
+            # Saved verbatim — in relative-CP mode this is offsets, otherwise absolute
+            # positions. The `relative_control_points` flag tells the loader how to
+            # interpret them.
             "control_points": self.control_points.detach().cpu().tolist(),
+            "relative_control_points": self.relative_control_points,
             "c1_mask": self.c1_mask.cpu().tolist(),
             "g1_mask": self.g1_mask.cpu().tolist(),
             "g1_scale": self.g1_scale.cpu().tolist(),
@@ -804,7 +883,7 @@ class Spline(nn.Module):
         with open(path, "r") as f:
             data = json.load(f)
         version = data.get("version")
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ValueError(f"Unsupported spline file version: {version}")
         kwargs = dict(
             num_dim=data["num_dim"],
@@ -815,6 +894,8 @@ class Spline(nn.Module):
             control_points=torch.tensor(data["control_points"], dtype=torch.float32),
             c1_mask=torch.tensor(data["c1_mask"], dtype=torch.bool),
             interval_widths=torch.tensor(data["interval_widths"], dtype=torch.float32),
+            # Default False on v1/v2 files (which predate the flag).
+            relative_control_points=bool(data.get("relative_control_points", False)),
             name=data.get("name", ""),
         )
         if "g1_mask" in data:
@@ -1065,7 +1146,10 @@ class Spline(nn.Module):
         num_ctrl = self.max_intervals * self.__ctrl_pts_per_interval
 
         new_joint = initial_points.unsqueeze(1).expand(N, num_joint, D).clone()
-        new_ctrl = initial_points.unsqueeze(1).expand(N, num_ctrl, D).clone()
+        if self.relative_control_points:
+            new_ctrl = torch.zeros(N, num_ctrl, D, dtype=initial_points.dtype, device=initial_points.device)
+        else:
+            new_ctrl = initial_points.unsqueeze(1).expand(N, num_ctrl, D).clone()
         # New curves default to g1_scale = 1.0 at every junction (C1-equivalent).
         new_g1_scale = torch.ones(N, num_joint, dtype=self.g1_scale.dtype, device=self.g1_scale.device)
 
@@ -1144,7 +1228,14 @@ class Spline(nn.Module):
         new_max = int(new_intervals_per_curve.max().item())
 
         jp = self.joint_points.detach()    # (C, old_max+1, dim)
-        cp = self.control_points.detach()  # (C, old_max*k_per, dim)
+        # `cp` is consumed in the De Casteljau / C1-fix math as absolute world-space
+        # positions. In relative-CP mode the stored Parameter holds per-slot offsets,
+        # so convert to absolute up front. `new_cp` is then assembled entirely in
+        # absolute and converted back to offsets at the bottom of this function.
+        cp_abs_view = self._cp_to_absolute(
+            self.control_points.detach().view(C, self.max_intervals, k_per, dim)
+        )
+        cp = cp_abs_view.reshape(C, self.max_intervals * k_per, dim)
         eff_cp = self.get_effective_control_points().detach()  # (C, old_max, k_per, dim)
 
         new_jp = torch.zeros(C, new_max + 1, dim, dtype=jp.dtype, device=jp.device)
@@ -1438,6 +1529,15 @@ class Spline(nn.Module):
                     if k + 1 < n:
                         new_w[c, k + 2:n + 1] = old_w[c, k + 1:n]
 
+        # `new_cp` was assembled in absolute world-space. In relative-CP mode the
+        # returned tensor must be per-slot offsets anchored to the POST-split joint
+        # layout (new_jp), since the caller installs it as the new control_points
+        # Parameter, which is interpreted in the current storage mode.
+        if self.relative_control_points:
+            new_cp_view = new_cp.view(C, new_max, k_per, dim)
+            new_cp_view = self._cp_to_offsets(new_cp_view, joint_points=new_jp)
+            new_cp = new_cp_view.reshape(C, new_max * k_per, dim)
+
         if self.trainable_widths:
             # Convert post-split widths to logits. Padding slots (k >= new_intervals_per_curve[c])
             # get the sentinel; valid slots get log(width). Detach from autograd because the
@@ -1531,7 +1631,15 @@ class Spline(nn.Module):
         return dev
 
     def mask_curves_bounding_box(self, threshold: float):
-        all_points = torch.cat([self.joint_points, self.control_points], dim=1)  # (N, K, dim)
+        # Use absolute CP positions so the bbox is meaningful in both storage
+        # modes. In relative mode, self.control_points holds per-slot offsets,
+        # which would yield a bbox centred near the origin instead of around the
+        # actual curve geometry.
+        k_per = self.__ctrl_pts_per_interval
+        abs_cp = self._cp_to_absolute(
+            self.control_points.view(self.num_curves, self.max_intervals, k_per, self.num_dim)
+        ).reshape(self.num_curves, self.max_intervals * k_per, self.num_dim)
+        all_points = torch.cat([self.joint_points, abs_cp], dim=1)  # (N, K, dim)
         min_xyz = all_points.min(dim=1).values
         max_xyz = all_points.max(dim=1).values
         movement_extent = torch.norm(max_xyz - min_xyz, dim=1)  # (N,)
