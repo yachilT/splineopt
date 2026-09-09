@@ -7,7 +7,7 @@ from .curve import Bezier, Curve
 
 
 class Spline(nn.Module):
-    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, src_is_next_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, relative_control_points: bool = False, name: str = ""):
+    def __init__(self, num_dim: int, num_intervals: Union[int, torch.Tensor], num_curves: int = 1, curve: Curve = Bezier(degree=3), joint_points: Optional[torch.Tensor] = None, control_points: Optional[torch.Tensor] = None, c1_mask: Optional[torch.Tensor] = None, g1_mask: Optional[torch.Tensor] = None, g1_scale: Optional[torch.Tensor] = None, src_is_next_mask: Optional[torch.Tensor] = None, interval_widths: Optional[torch.Tensor] = None, trainable_widths: bool = False, relative_control_points: bool = False, soft_boundaries: bool = False, soft_boundary_alpha: float = 0.2, name: str = ""):
         """
         Initialize the spline object with num_curves, control points, joint points, and curve object.
 
@@ -47,6 +47,13 @@ class Spline(nn.Module):
         self.name = name
         self.trainable_widths = bool(trainable_widths)
         self.relative_control_points = bool(relative_control_points)
+        # Trapezoidal partition-of-unity blending across interval boundaries. When True,
+        # forward() and derivative() evaluate a 3-candidate stencil per query and combine
+        # them with a trapezoidal mask of relative half-width alpha*min(w_k, w_{k+1}).
+        # Far from joints the mask is (..0, 1, 0..) and output is identical to the hard
+        # path; inside the eps-band it creates a smooth selection gradient on widths.
+        self.soft_boundaries = bool(soft_boundaries)
+        self.soft_boundary_alpha = float(soft_boundary_alpha)
         # Sentinel value for padding slots in _width_logits. exp(-1e9) ~ 0, so masked
         # softmax over a row puts ~0 mass on padding regardless of its other entries.
         self._WIDTH_LOGIT_PAD = -1e9
@@ -615,6 +622,96 @@ class Spline(nn.Module):
 
         return interval_idx, local_t, widths
 
+    def _map_to_local_soft(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Soft-boundary variant of map_to_local. Returns a 3-candidate stencil per
+        query (active interval and its two neighbors) plus trapezoidal partition-of-
+        unity masks summing to 1 across candidates.
+
+        local_t is NOT clamped to [0, 1] for non-active candidates — small extrapolations
+        outside [0, 1] are the mechanism that gives the two pieces different positions
+        at the boundary, which is what creates the selection gradient on widths.
+
+        Returns:
+            cand_idx     (C, N, 3) long  — interval indices; invalid neighbors
+                                            (e.g. -1 at the left domain edge) are
+                                            clamped to the active idx for safe gather.
+            cand_local_t (C, N, 3) float — per-candidate local parameter, unclamped.
+            cand_mask    (C, N, 3) float — POU weights, sum to 1 across dim=2 in the
+                                            valid region.
+            cand_widths  (C, N, 3) float — per-candidate widths (for derivative chain rule).
+        """
+        device = t.device
+        C = self.num_curves
+        N = t.shape[0]
+        alpha = self.soft_boundary_alpha
+
+        w = self.interval_widths.to(device)              # (C, max_intervals)
+        cum_w = torch.cumsum(w, dim=1)                   # right edges
+        cum_w_padded = torch.cat(                         # left edges (shifted)
+            [torch.zeros(C, 1, device=device, dtype=cum_w.dtype), cum_w], dim=1
+        )                                                 # (C, max_intervals+1)
+
+        t_expanded = t.unsqueeze(0).expand(C, N).contiguous()
+        active_idx = torch.searchsorted(cum_w, t_expanded)         # (C, N)
+        max_idx = (self.intervals_per_curve.to(device) - 1).unsqueeze(1)  # (C, 1)
+        active_idx = torch.clamp(active_idx, max=max_idx.expand_as(active_idx))
+
+        # 3-candidate stencil. raw_cand may go negative or past ipc-1; those slots
+        # are flagged invalid (mask=0) and their indices are clamped into valid range
+        # so gather never touches padding slots (which have width=0 and would NaN).
+        offsets = torch.tensor([-1, 0, 1], device=device, dtype=torch.long)
+        raw_cand = active_idx.unsqueeze(-1) + offsets                # (C, N, 3)
+        max_idx_b = max_idx.unsqueeze(-1)                            # (C, 1, 1)
+        valid = (raw_cand >= 0) & (raw_cand <= max_idx_b)            # (C, N, 3)
+        cand_idx = raw_cand.clamp(min=0)
+        cand_idx = torch.minimum(cand_idx, max_idx_b.expand_as(cand_idx))
+
+        # Gather per-candidate width and left edge.
+        flat = cand_idx.reshape(C, N * 3)
+        cand_widths = torch.gather(w, 1, flat).reshape(C, N, 3)
+        cand_left_edges = torch.gather(cum_w_padded, 1, flat).reshape(C, N, 3)
+        cand_right_edges = cand_left_edges + cand_widths
+
+        # Per-candidate local_t (no clamp — extrapolation is the mechanism).
+        cand_local_t = (t_expanded.unsqueeze(-1) - cand_left_edges) / cand_widths.clamp(min=1e-12)
+
+        # Trapezoidal POU. For each candidate m we need ε at its left joint
+        # (between m-1 and m) and right joint (between m and m+1):
+        #   ε_left(m)  = 2α · min(w_{m-1}, w_m)
+        #   ε_right(m) = 2α · min(w_m,     w_{m+1})
+        # When m has no left or right neighbor (m=0 or m=ipc-1), the corresponding
+        # ramp degenerates to a hard step: ramp = 1 (we own everything up to the
+        # domain edge on that side).
+        left_nbr_idx = (cand_idx - 1).clamp(min=0)
+        right_nbr_idx = torch.minimum(cand_idx + 1, max_idx_b.expand_as(cand_idx))
+        cand_w_left = torch.gather(w, 1, left_nbr_idx.reshape(C, N * 3)).reshape(C, N, 3)
+        cand_w_right = torch.gather(w, 1, right_nbr_idx.reshape(C, N * 3)).reshape(C, N, 3)
+
+        has_left = (cand_idx > 0)
+        has_right = (cand_idx < max_idx_b.expand_as(cand_idx))
+
+        eps_left = 2.0 * alpha * torch.minimum(cand_widths, cand_w_left)
+        eps_right = 2.0 * alpha * torch.minimum(cand_widths, cand_w_right)
+
+        t_minus_L = t_expanded.unsqueeze(-1) - cand_left_edges
+        R_minus_t = cand_right_edges - t_expanded.unsqueeze(-1)
+
+        eps_left_safe = eps_left.clamp(min=1e-12)
+        eps_right_safe = eps_right.clamp(min=1e-12)
+        left_ramp_soft = ((t_minus_L + eps_left * 0.5) / eps_left_safe).clamp(0.0, 1.0)
+        right_ramp_soft = ((R_minus_t + eps_right * 0.5) / eps_right_safe).clamp(0.0, 1.0)
+
+        # Hard step at domain edges (no neighbor on that side).
+        ones = torch.ones_like(left_ramp_soft)
+        left_ramp = torch.where(has_left, left_ramp_soft, ones)
+        right_ramp = torch.where(has_right, right_ramp_soft, ones)
+
+        cand_mask = torch.minimum(left_ramp, right_ramp)
+        cand_mask = cand_mask * valid.to(cand_mask.dtype)
+
+        return cand_idx, cand_local_t, cand_mask, cand_widths
+
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Evaluates the spline at given parameter values `t`.
@@ -650,30 +747,35 @@ class Spline(nn.Module):
                 self.num_curves, N, self.num_dim
             ).contiguous()
 
-        # Step 1: Per-curve interval mapping (non-uniform widths)
-        interval_idx, local_t, _widths = self.map_to_local(t)
+        exponents = self._exponents.to(device)                          # (degree+1,)
+        char_mat = self.curve.char_mat.to(device)                       # (degree+1, degree+1)
+        points = self._assemble_interval_points()                       # (C, max_intervals, degree+1, dim)
+        D1 = self.curve.degree + 1
 
-        # Step 2: Compute t_powers: (C, N, degree+1)
-        exponents = self._exponents.to(device)  # (degree+1,)
-        t_powers = local_t.unsqueeze(-1).pow(exponents)  # (C, N, degree+1)
+        if not self.soft_boundaries:
+            # Hard path — bit-identical to pre-soft behavior.
+            interval_idx, local_t, _widths = self.map_to_local(t)
+            t_powers = local_t.unsqueeze(-1).pow(exponents)             # (C, N, D+1)
+            t_transformed = t_powers @ char_mat                         # (C, N, D+1)
+            idx = interval_idx.unsqueeze(-1).unsqueeze(-1)
+            idx = idx.expand(-1, -1, D1, self.num_dim)                  # (C, N, D+1, dim)
+            gathered_points = torch.gather(points, dim=1, index=idx)    # (C, N, D+1, dim)
+            return torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)
 
-        # Step 4: Apply characteristic (Bernstein) matrix: (C, N, degree+1)
-        char_mat = self.curve.char_mat.to(device)  # (degree+1, degree+1)
-        t_transformed = t_powers @ char_mat         # (C, N, degree+1)
+        # Soft path — 3-candidate stencil with trapezoidal POU mask.
+        cand_idx, cand_local_t, cand_mask, _cand_widths = self._map_to_local_soft(t)  # (C, N, 3)
+        C = self.num_curves
+        N = t.shape[0]
 
-        # Step 5: Assemble interval control points: (C, max_intervals, degree+1, dim)
-        points = self._assemble_interval_points()
+        t_powers = cand_local_t.unsqueeze(-1).pow(exponents)            # (C, N, 3, D+1)
+        t_transformed = t_powers @ char_mat                             # (C, N, 3, D+1)
 
-        # Step 6: Gather relevant points per (curve, query_point)
-        # interval_idx: (C, N) -> expand to index into points dim=1
-        idx = interval_idx.unsqueeze(-1).unsqueeze(-1)  # (C, N, 1, 1)
-        idx = idx.expand(-1, -1, self.curve.degree + 1, self.num_dim)  # (C, N, degree+1, dim)
-        gathered_points = torch.gather(points, dim=1, index=idx)  # (C, N, degree+1, dim)
+        idx_flat = cand_idx.reshape(C, N * 3, 1, 1).expand(-1, -1, D1, self.num_dim)
+        gathered_flat = torch.gather(points, dim=1, index=idx_flat)     # (C, N*3, D+1, dim)
+        gathered_points = gathered_flat.reshape(C, N, 3, D1, self.num_dim)
 
-        # Step 7: Evaluate via einsum
-        result = torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)  # (C, N, dim)
-
-        return result
+        per_cand = torch.einsum('cnmk,cnmkd->cnmd', t_transformed, gathered_points)
+        return (cand_mask.unsqueeze(-1) * per_cand).sum(dim=2)          # (C, N, dim)
 
     def derivative(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -700,37 +802,48 @@ class Spline(nn.Module):
         N = t.shape[0]
         device = t.device
         D = self.curve.degree
+        D1 = D + 1
 
-        # Same interval mapping as forward()
-        interval_idx, local_t, widths = self.map_to_local(t)
-
-        # Derivative t-powers: d/dt[t^i] = i * t^(i-1), with d/dt[t^0] = 0
-        # Computed as: coeffs[i] * local_t^shifted_exps[i]
-        #   coeffs        = [0, 1, 2, ..., D]
-        #   shifted_exps  = [0, 0, 1, ..., D-1]  (index 0 is killed by coeff=0)
-        coeffs = torch.arange(D + 1, dtype=torch.float32, device=device)  # (D+1,)
+        # Derivative-of-monomial table is shared by both paths.
+        # coeffs = [0, 1, 2, ..., D], shifted_exps = [0, 0, 1, ..., D-1]
+        coeffs = torch.arange(D1, dtype=torch.float32, device=device)
         shifted_exps = torch.cat([
             torch.zeros(1, dtype=torch.float32, device=device),
             torch.arange(D, dtype=torch.float32, device=device),
-        ])  # (D+1,)
-        d_t_powers = coeffs * local_t.unsqueeze(-1).pow(shifted_exps)  # (C, N, D+1)
-
-        # Apply characteristic matrix (curve-type-specific, same as forward)
+        ])
         char_mat = self.curve.char_mat.to(device)
-        t_transformed = d_t_powers @ char_mat  # (C, N, D+1)
+        points = self._assemble_interval_points()
 
-        # Gather interval control points (same as forward)
-        points = self._assemble_interval_points()  # (C, max_intervals, D+1, dim)
-        idx = interval_idx.unsqueeze(-1).unsqueeze(-1)
-        idx = idx.expand(-1, -1, D + 1, self.num_dim)
-        gathered_points = torch.gather(points, dim=1, index=idx)  # (C, N, D+1, dim)
+        if not self.soft_boundaries:
+            interval_idx, local_t, widths = self.map_to_local(t)
+            d_t_powers = coeffs * local_t.unsqueeze(-1).pow(shifted_exps)   # (C, N, D+1)
+            t_transformed = d_t_powers @ char_mat
+            idx = interval_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, D1, self.num_dim)
+            gathered_points = torch.gather(points, dim=1, index=idx)
+            result = torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)
+            return result * (1.0 / widths.clamp(min=1e-12)).unsqueeze(-1)
 
-        result = torch.einsum('cnk,cnkd->cnd', t_transformed, gathered_points)  # (C, N, dim)
+        # Soft path. The full velocity of the smoothed output is
+        #     d/dt output = Σ_m mask_m · (1/w_m) · B_m'(local_t_m)
+        #                 + Σ_m (∂mask_m/∂t) · B_m(local_t_m)
+        # We implement only the first (in-piece) term; the second term redistributes
+        # contributions within the ε-band and is small under C1/G1 (where B_m agree
+        # at the joint). If a velocity-based loss needs the exact derivative inside
+        # ε-bands, add the second term — `cand_mask` is piecewise-linear in t with
+        # known slopes ±1/eps_left and ∓1/eps_right.
+        cand_idx, cand_local_t, cand_mask, cand_widths = self._map_to_local_soft(t)
+        C = self.num_curves
 
-        # Chain rule: d/dt_global = (1 / width) * d/dt_local
-        result = result * (1.0 / widths.clamp(min=1e-12)).unsqueeze(-1)
+        d_t_powers = coeffs * cand_local_t.unsqueeze(-1).pow(shifted_exps)  # (C, N, 3, D+1)
+        t_transformed = d_t_powers @ char_mat                                # (C, N, 3, D+1)
 
-        return result
+        idx_flat = cand_idx.reshape(C, N * 3, 1, 1).expand(-1, -1, D1, self.num_dim)
+        gathered_flat = torch.gather(points, dim=1, index=idx_flat)
+        gathered_points = gathered_flat.reshape(C, N, 3, D1, self.num_dim)
+
+        per_cand = torch.einsum('cnmk,cnmkd->cnmd', t_transformed, gathered_points)
+        inv_w = (1.0 / cand_widths.clamp(min=1e-12)).unsqueeze(-1)            # (C, N, 3, 1)
+        return (cand_mask.unsqueeze(-1) * inv_w * per_cand).sum(dim=2)
 
     def get_lines(self, batch: int) -> List[np.ndarray]:
         num_intervals = int(self.intervals_per_curve[batch].item())
